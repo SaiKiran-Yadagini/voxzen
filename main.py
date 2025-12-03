@@ -72,7 +72,22 @@ try:
     else:
         # Linux/Mac: Use uvloop (2-4x faster async I/O)
         import uvloop
-        uvloop.install()
+        # Set the policy instead of install() to be compatible with LiveKit CLI
+        # This allows LiveKit to create the event loop, which will use uvloop's policy
+        asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+        # uvloop's policy requires an event loop to exist before get_event_loop() is called
+        # Create and set it here to ensure compatibility with LiveKit CLI
+        try:
+            # Check if event loop already exists
+            loop = asyncio.get_event_loop()
+            if loop.is_closed():
+                # If closed, create a new one
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+        except RuntimeError:
+            # No event loop exists, create one
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
         print("✓ uvloop enabled - 2-4x faster async I/O")
 except ImportError as e:
     print(f"ℹ Fast event loop not available ({e}) - using default event loop")
