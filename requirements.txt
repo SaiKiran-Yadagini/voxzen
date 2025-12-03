@@ -1,0 +1,9 @@
+livekit-agents
+livekit-plugins-deepgram
+livekit-plugins-openai
+livekit-plugins-cartesia
+python-dotenv
+numpy
+winloop; sys_platform == "win32"
+uvloop; sys_platform != "win32"
+
