@@ -1,9 +1,10 @@
 livekit-agents
 livekit-plugins-deepgram
 livekit-plugins-openai
+livekit-plugins-elevenlabs
 livekit-plugins-cartesia
 python-dotenv
-numpy
+numpy>=1.24.0
 winloop; sys_platform == "win32"
 uvloop; sys_platform != "win32"
 
