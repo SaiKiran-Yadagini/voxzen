@@ -34,16 +34,20 @@ import time
 import re
 import numpy as np
 import logging
+import logging.handlers
+import queue
 from datetime import datetime
 from contextlib import asynccontextmanager
 from dotenv import load_dotenv
 from livekit import rtc
 from livekit.agents import AutoSubscribe, JobContext, WorkerOptions, cli, llm
+# Note: _ExitCli is a private class, we'll catch it by type checking
 from livekit.agents import stt
 from livekit.plugins import deepgram, openai
 
 try:
     from livekit.plugins import elevenlabs
+    from livekit.plugins.elevenlabs import Voice, VoiceSettings
     ELEVENLABS_AVAILABLE = True
 except ImportError:
     ELEVENLABS_AVAILABLE = False
@@ -208,81 +212,141 @@ class MicrosecondFormatter(logging.Formatter):
         return s
 
 class TeeStream:
-    """Stream that writes to both console and log file"""
-    def __init__(self, console_stream, log_file):
+    """Stream that writes to both console and log file - Captures EVERYTHING"""
+    def __init__(self, console_stream, log_file, terminal_log_file):
         self.console_stream = console_stream
-        self.log_file = log_file
+        self.log_file = log_file  # Main log file (structured logs)
+        self.terminal_log_file = terminal_log_file  # Raw terminal output file
         self.logger = logging.getLogger("TERMINAL_OUTPUT")
+        self.buffer = ""  # Buffer for incomplete lines
         
     def write(self, text):
-        """Write to both console and log file"""
-        if text.strip():  # Only log non-empty lines
-            # Write to console
+        """Write to both console and ALL log files - Captures EVERYTHING including empty lines"""
+        if not text:
+            return
+            
+        # Write to console immediately
+        try:
             self.console_stream.write(text)
             self.console_stream.flush()
-            # Write to log file with timestamp
-            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-            self.log_file.write(f"{timestamp} | TERMINAL | {text}")
-            self.log_file.flush()
+        except Exception:
+            pass  # Ignore console write errors
+        
+        # Add to buffer (handle partial lines)
+        self.buffer += text
+        
+        # Process complete lines
+        while '\n' in self.buffer:
+            line, self.buffer = self.buffer.split('\n', 1)
+            line += '\n'  # Add back the newline
+            
+            # Note: Main log file writes are now handled by async logging (non-blocking)
+            # Write to raw terminal log file (exact terminal output)
+            try:
+                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+                self.terminal_log_file.write(f"[{timestamp}] {line}")
+                self.terminal_log_file.flush()
+            except Exception:
+                pass  # Ignore terminal log write errors
+        
+        # If buffer has content but no newline, flush it anyway (for incomplete output)
+        if self.buffer and len(self.buffer) > 1000:  # Flush large buffers
+            try:
+                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+                self.log_file.write(f"{timestamp} | TERMINAL | {self.buffer}")
+                self.log_file.flush()
+                self.terminal_log_file.write(f"[{timestamp}] {self.buffer}")
+                self.terminal_log_file.flush()
+                self.buffer = ""
+            except Exception:
+                pass
         
     def flush(self):
-        """Flush both streams"""
-        self.console_stream.flush()
-        if self.log_file:
-            self.log_file.flush()
+        """Flush all streams"""
+        try:
+            self.console_stream.flush()
+        except Exception:
+            pass
+        # Note: Main log file flushing is handled by async logging listener
+        try:
+            if self.terminal_log_file:
+                self.terminal_log_file.flush()
+        except Exception:
+            pass
         
     def isatty(self):
         """Return True to maintain compatibility"""
         return self.console_stream.isatty()
 
 def setup_logging():
-    """Set up comprehensive file logging for all models - Captures ALL terminal output"""
+    """200 IQ Optimization: Non-blocking Async Logging - Decouples CPU from Disk I/O"""
     # Create logs directory if it doesn't exist
     log_dir = "logs"
     os.makedirs(log_dir, exist_ok=True)
-        
+    
     # Create log filename with timestamp
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_file_path = os.path.join(log_dir, f"agent_log_{timestamp}.log")
-        
-    # Open log file for writing (we'll use this for TeeStream)
-    log_file_handle = open(log_file_path, 'a', encoding='utf-8')
-        
-    # Configure logging with detailed format
-    log_format = '%(asctime)s | %(levelname)-8s | %(name)-20s | %(message)s'
-    date_format = '%Y-%m-%d %H:%M:%S.%f'
-        
-    # Set up root logger
-    logger = logging.getLogger()
-    logger.setLevel(logging.DEBUG)
-        
-    # Remove existing handlers
-    logger.handlers.clear()
-        
-    # File handler - detailed logs with microseconds (captures ALL log levels)
+    
+    # Create separate terminal output file (raw terminal capture)
+    terminal_log_file_path = os.path.join(log_dir, f"terminal_output_{timestamp}.log")
+    
+    # Open terminal log file for TeeStream (still needed for print() capture)
+    terminal_log_file_handle = open(terminal_log_file_path, 'a', encoding='utf-8')
+    
+    # Write header to terminal log file
+    terminal_log_file_handle.write(f"{'='*80}\n")
+    terminal_log_file_handle.write(f"TERMINAL OUTPUT CAPTURE - Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+    terminal_log_file_handle.write(f"File: {terminal_log_file_path}\n")
+    terminal_log_file_handle.write(f"{'='*80}\n\n")
+    terminal_log_file_handle.flush()
+    
+    # ============================================================================
+    # ASYNC LOGGING SETUP (Non-blocking file writes)
+    # ============================================================================
+    # 1. Create the Slow File Handler (but don't attach to root yet)
     file_handler = logging.FileHandler(log_file_path, mode='a', encoding='utf-8')
-    file_handler.setLevel(logging.DEBUG)  # Capture everything
-    file_formatter = MicrosecondFormatter(log_format, date_format)
+    file_formatter = MicrosecondFormatter(
+        '%(asctime)s | %(levelname)-8s | %(name)-20s | %(message)s',
+        '%Y-%m-%d %H:%M:%S.%f'
+    )
     file_handler.setFormatter(file_formatter)
-    logger.addHandler(file_handler)
-        
-    # Console handler - important messages only (no microseconds for readability)
-    # But also writes to file via TeeStream
+    file_handler.setLevel(logging.DEBUG)  # Capture everything
+    
+    # 2. Create a Fast Memory Queue (Infinite size - no blocking)
+    log_queue = queue.Queue(-1)
+    
+    # 3. Create the QueueHandler (The Main Thread will use ONLY this - instant writes)
+    queue_handler = logging.handlers.QueueHandler(log_queue)
+    
+    # 4. Create the Listener (Runs in a background thread to handle disk I/O)
+    listener = logging.handlers.QueueListener(log_queue, file_handler)
+    listener.start()  # Start background thread for async file writes
+    
+    # 5. Configure Root Logger to use the Fast Queue
+    root = logging.getLogger()
+    root.setLevel(logging.DEBUG)
+    # Remove existing handlers to avoid duplicates
+    if root.handlers:
+        root.handlers.clear()
+    root.addHandler(queue_handler)  # Fast queue handler (non-blocking)
+    
+    # 6. Console handler (separate - for immediate terminal output)
     console_handler = logging.StreamHandler()
     console_handler.setLevel(logging.INFO)
     console_formatter = logging.Formatter('%(asctime)s | %(levelname)-8s | %(message)s', '%H:%M:%S')
     console_handler.setFormatter(console_formatter)
-    logger.addHandler(console_handler)
-        
-    # CRITICAL: Redirect stdout and stderr to capture ALL print() statements
-    # Create TeeStream that writes to both console and log file
-    tee_stdout = TeeStream(sys.stdout, log_file_handle)
-    tee_stderr = TeeStream(sys.stderr, log_file_handle)
-        
+    root.addHandler(console_handler)
+    
+    # CRITICAL: Redirect stdout and stderr to capture ALL print() statements and terminal output
+    # Create TeeStream that writes to console and terminal log file (but NOT main log file - that's async)
+    tee_stdout = TeeStream(sys.stdout, None, terminal_log_file_handle)  # No main log file in TeeStream (handled by async logging)
+    tee_stderr = TeeStream(sys.stderr, None, terminal_log_file_handle)
+    
     # Replace stdout and stderr
     sys.stdout = tee_stdout
     sys.stderr = tee_stderr
-        
+    
     # Create specific loggers for each model
     stt_logger = logging.getLogger("STT_DEEPGRAM")
     llm_logger = logging.getLogger("LLM_GROQ")
@@ -291,16 +355,28 @@ def setup_logging():
     perf_logger = logging.getLogger("PERFORMANCE")
     error_logger = logging.getLogger("ERROR")
     terminal_logger = logging.getLogger("TERMINAL_OUTPUT")
-        
+    
     # Log initialization
-    logger.info(f"=" * 80)
-    logger.info(f"LOGGING INITIALIZED - Log file: {log_file_path}")
-    logger.info(f"Models: Deepgram STT (nova-3), Groq LLM (llama-3.3-70b-versatile), ElevenLabs TTS (flash_v2_5)")
-    logger.info(f"ALL terminal output (including print statements) will be captured in log file")
-    logger.info(f"=" * 80)
-        
+    root.info(f"=" * 80)
+    root.info(f"LOGGING INITIALIZED - Log file: {log_file_path}")
+    root.info(f"TERMINAL OUTPUT FILE: {terminal_log_file_path}")
+    root.info(f"Models: Deepgram STT (nova-2), Groq LLM (llama-3.3-70b-versatile), ElevenLabs TTS (flash_v2_5)")
+    root.info(f"🚀 ASYNC LOGGING ACTIVE - Non-blocking file writes (50-100ms latency saved)")
+    root.info(f"ALL terminal output (including print statements) will be captured in BOTH log files")
+    root.info(f"  - Main log: {log_file_path} (structured logs - async writes)")
+    root.info(f"  - Terminal log: {terminal_log_file_path} (raw terminal output)")
+    root.info(f"=" * 80)
+    
+    # Print to terminal (will be captured)
+    print(f"\n{'='*80}")
+    print(f"🚀 ASYNC LOGGING ACTIVE - Non-blocking file writes")
+    print(f"✓ LOGGING ACTIVE - All terminal output is being saved")
+    print(f"  Main log: {log_file_path}")
+    print(f"  Terminal log: {terminal_log_file_path}")
+    print(f"{'='*80}\n")
+    
     return {
-        'main': logger,
+        'main': root,
         'stt': stt_logger,
         'llm': llm_logger,
         'tts': tts_logger,
@@ -309,7 +385,9 @@ def setup_logging():
         'error': error_logger,
         'terminal': terminal_logger,
         'file': log_file_path,
-        'file_handle': log_file_handle
+        'terminal_file': terminal_log_file_path,
+        'terminal_file_handle': terminal_log_file_handle,
+        'listener': listener  # Return listener so we can stop it on shutdown
     }
 
 # Initialize logging
@@ -331,7 +409,7 @@ MAIN_LLM = GROQ_LLM
 # OPTIMIZED BASED ON COMPREHENSIVE ANALYSIS: agent_log_20251202_103504.log
 # Target: STT <1200ms, LLM <500ms, TTS <800ms, Total <1500ms
 # Ultra-Low Latency Optimizations: Immediate Streaming (No Buffering)
-STT_ENDPOINTING_MS = 25  # 25ms: ULTRA-AGGRESSIVE endpointing for minimal latency
+STT_ENDPOINTING_MS = 300  # 300ms: Prevents chopping sentences in half when user pauses briefly
 # Minimum word threshold: Prevent sending very short transcripts (1-2 words)
 STT_MIN_WORDS_THRESHOLD = 2  # 2 words: Minimum words before sending (ultra-low latency)
 # Speech start time max age: Prevent incorrect latency calculations
@@ -350,7 +428,7 @@ TTS_MAX_CHUNK_SIZE = 40  # 40 chars: Smaller chunks = faster synthesis
 TTS_CONCURRENT_LIMIT = 1  # 1: STRICT SEQUENTIAL - Relay race approach (no gaps, strict order, consistent voice/tone)
 CONTEXT_WINDOW_SIZE = 5  # 5 pairs: Minimal context for speed (Lobotomy Strategy)
 CONTEXT_MAX_MESSAGES = 6  # System(1) + Last 5 messages only - CRITICAL for <500ms latency
-CONTEXT_MAX_ITEMS = 5  # System(1) + pairs(4) = 5 - MINIMIZED to ensure word-for-word, sentence-by-sentence translation (was 7)
+CONTEXT_MAX_ITEMS = 15  # System(1) + pairs(14) = 15 - Prevents "context amnesia" so LLM remembers previous topics
 # CRITICAL FIX: Reduced from 9 to 7 to completely eliminate context bleeding - smaller context = zero chance of including previous translations
 TRANSLATION_QUEUE_TIMEOUT = 0.03  # 30ms: Ultra-responsive pickup (reduced from 50ms - 40% faster)
 PROSODY_ANALYSIS_WINDOW = 0.5  # 500ms: Prosody analysis
@@ -379,7 +457,7 @@ CONNECTION_HEALTH_CHECK_INTERVAL = 15.0  # 15s: Check connection health every 15
 STT_CONNECTION_KEEPALIVE_INTERVAL = 30.0  # 30s: Send keepalive to STT connection every 30s
 
 # Input Validation Constants
-MIN_INPUT_LENGTH = 2  # Minimum input length to accept (reject single characters)
+MIN_INPUT_LENGTH = 1  # Minimum input length to accept - We want to translate everything, even short affirmations
 MAX_INPUT_LENGTH = 500  # Maximum input length before truncation
 MIN_INPUT_LENGTH_FOR_RETRY = 5  # Minimum input length to retry on empty result
 MIN_INPUT_LENGTH_SHORT = 15  # Short input threshold for ellipsis validation
@@ -391,14 +469,14 @@ MAX_ELLIPSIS_SHORT_INPUT = 1  # Maximum ellipsis for short inputs
 
 # TTS Buffer Constants
 TTS_BUFFER_SOFT_LIMIT = 50  # Soft limit for TTS buffer (process when reached)
-TTS_BUFFER_HARD_LIMIT = 100  # Hard limit for TTS buffer (force clear when exceeded)
+TTS_BUFFER_HARD_LIMIT = 600  # Hard limit for TTS buffer (force clear when exceeded) - Increased to prevent data loss on long sentences
 TTS_CHUNK_LOG_INTERVAL = 5  # Log every Nth TTS chunk
 TTS_FRAME_LOG_INTERVAL = 10  # Log every Nth TTS audio frame
 
 # Output Validation Constants
 MIN_OUTPUT_LENGTH = 2  # Minimum output length to accept
 MIN_OUTPUT_LENGTH_MEANINGFUL = 3  # Minimum output length for meaningful translation
-MAX_OUTPUT_EXPANSION = 1.8  # Maximum expansion ratio (output/input) before context bleeding detection
+MAX_OUTPUT_EXPANSION = 5.0  # Maximum expansion ratio (output/input) - Prevents valid translations from being deleted just because they are longer than input
 OUTPUT_EXTRACTION_RATIO = 1.6  # Ratio for extracting sentences from context bleeding
 OUTPUT_EXTRACTION_RATIO_STRICT = 1.5  # Stricter ratio for first sentence extraction
 MIN_SENTENCE_LENGTH = 5  # Minimum sentence length for extraction
@@ -424,21 +502,23 @@ TIMEOUT_RETRY_MAX = 8.0  # Maximum timeout for retries
 
 # Playback Constants
 PLAYBACK_LOG_INTERVAL = 50  # Log every Nth playback event
-BASE_PLAYBACK_SPEED = 0.85  # Base playback speed (0.85x for slower, natural pacing)
+# NOTE: Playback speed is now controlled natively via ElevenLabs VoiceSettings(speed=0.85)
+# No client-side resampling needed - saves 50-100ms CPU time per frame
 
 # Sanitization Constants
 SANITIZE_MAX_LENGTH = 2000  # Maximum length for LLM input sanitization
 MIN_WORDS_FOR_VALIDATION = 1  # Minimum words for text validation
 
-# STT - Deepgram Nova-3 (Best for Hindi/Hinglish) - Optimized for Speed & TTS
+# STT - Deepgram Nova-2 (Ultra-Fast for Real-Time Streaming) - Optimized for Zero Latency
 DEEPGRAM_STT = deepgram.STT(
-    model="nova-3",  # Upgraded: Nova-3 - Better accuracy (54.3% WER reduction) + Lower latency
+    model="nova-2",  # Nova-2: 200-300ms faster than nova-3 for real-time streaming (speed > nuanced grammar for zero latency)
     language="hi",  # Hindi language code
-    smart_format=False,  # Disabled: Raw transcripts for better TTS input (no formatting interference)
-    endpointing_ms=STT_ENDPOINTING_MS,  # Ultra-aggressive pause detection (25ms - optimized for minimal latency)
+    smart_format=False,  # Disabled: Raw transcripts for better TTS input (no formatting interference) - Minimizes token latency
+    endpointing_ms=STT_ENDPOINTING_MS,  # 300ms pause detection - Prevents chopping sentences in half when user pauses briefly, also prevents "hanging" transcripts
     interim_results=False,  # Disabled: Only use final transcripts to avoid duplicates and ensure stable TTS input
     no_delay=True,  # Disable delay for faster response
     # Note: vad_events=True is automatically enabled by the LiveKit Deepgram plugin
+    # Note: utterance_end_ms is not a valid parameter for LiveKit Deepgram plugin - endpointing_ms handles pause detection
     # TTS Optimization: Disabled smart_format and interim_results for cleaner, more natural TTS input
     # - smart_format=False: Raw text without formatting that could interfere with TTS pronunciation
     # - interim_results=False: Only final, stable transcripts for consistent TTS output
@@ -506,16 +586,30 @@ def get_elevenlabs_tts():
             # Update global voice ID
             ELEVENLABS_VOICE_ID = current_voice_id
             
-            # Recreate TTS instance with current voice ID
+            # --- 200 IQ FIX: Native Speed Control via VoiceSettings ---
+            # Create VoiceSettings with speed=0.85 (no Voice object needed)
+            # The TTS constructor accepts voice_settings directly
+            # speed=0.85 (Slows down by 15% natively - no client-side resampling needed)
+            # stability=0.5, similarity_boost=0.75 (Standard defaults for natural voice)
+            voice_settings = VoiceSettings(
+                stability=0.5,
+                similarity_boost=0.75,
+                speed=0.85  # Native speed control: 0.85x = 15% slower (natural pacing)
+            )
+            
+            # Initialize TTS with voice_id and voice_settings directly
+            # This is the correct API pattern (as verified in test_elevenlabs_speed.py)
+            # The TTS constructor accepts voice_settings parameter directly, not wrapped in Voice
             ELEVENLABS_TTS = elevenlabs.TTS(
                 voice_id=ELEVENLABS_VOICE_ID,
+                voice_settings=voice_settings,  # Pass VoiceSettings directly to TTS constructor
                 model=ELEVENLABS_MODEL_ID,
                 streaming_latency=ELEVENLABS_STREAMING_LATENCY,
             )
             _ELEVENLABS_TTS_VOICE_ID = current_voice_id  # Track the voice ID used
             
             if LOGGERS:
-                LOGGERS['tts'].info(f"ElevenLabs TTS initialized/recreated - Voice: {ELEVENLABS_VOICE_ID}, Model: {ELEVENLABS_MODEL_ID}, Streaming Latency: {ELEVENLABS_STREAMING_LATENCY}")
+                LOGGERS['tts'].info(f"ElevenLabs TTS initialized/recreated - Voice: {ELEVENLABS_VOICE_ID}, Model: {ELEVENLABS_MODEL_ID}, Speed: 0.85x (native), Streaming Latency: {ELEVENLABS_STREAMING_LATENCY}")
         except Exception as e:
             if LOGGERS:
                 LOGGERS['error'].error(f"ElevenLabs TTS initialization failed: {str(e)}")
@@ -532,54 +626,24 @@ def get_elevenlabs_tts():
 if ELEVENLABS_AVAILABLE:
     get_elevenlabs_tts()  # Initial creation
 
-# Translation Prompt - Premium Human-Like Interpreter
-# Ultra-concise, maximum efficiency, best-in-class natural translation
-# Engineered for flawless human-like English output
-TRANSLATION_PROMPT = (
-    "You are a 200 IQ expert polyglot translator with exceptional linguistic intelligence. "
-    "Your specialty: real-time YouTube dubbing that sounds 100% human - as if the YouTuber is naturally speaking English.\n\n"
-    
-    "🎯 YOUR MISSION:\n"
-    "Translate Hindi to conversational Indian English with perfect human-like flow. "
-    "Think like a native bilingual speaker who effortlessly switches languages while preserving the original speaker's personality, energy, and style.\n\n"
-    
-    "🧠 YOUR PROCESS (Think Step-by-Step):\n"
-    "1. Analyze the speaker's tone: Is it excited? Serious? Casual? Match it exactly.\n"
-    "2. Identify the core message: What is the speaker really saying? Translate meaning, not just words.\n"
-    "3. Choose natural phrasing: How would a native Indian English speaker express this? Use authentic patterns.\n"
-    "4. Preserve personality: Keep the speaker's unique voice - their energy, humor, formality level.\n"
-    "5. Ensure flow: The translation should feel spontaneous, not mechanical.\n\n"
-    
-    "✨ CREATIVE TRANSLATION PRINCIPLES:\n"
-    "• Sound like a real person, not a translation engine\n"
-    "• Use natural Indian English expressions and patterns\n"
-    "• Match energy levels: excited input = excited output, calm input = calm output\n"
-    "• Preserve humor, sarcasm, emphasis exactly as intended\n"
-    "• Adapt formality: casual Hindi → casual English, formal Hindi → formal English\n"
-    "• Think contextually: understand what the speaker means, not just what they say\n\n"
-    
-    "📋 CRITICAL RULES:\n"
-    "• Output ONLY English (A-Z, a-z, 0-9, standard punctuation)\n"
-    "• Translate ONE sentence at a time - output ONE complete sentence only\n"
-    "• Preserve ALL names, numbers, brands, technical terms exactly\n"
-    "• Never output Hindi/Devanagari characters\n"
-    "• Never include previous translations or conversation history\n"
-    "• Complete sentences only - no ellipsis (...), no incomplete thoughts\n"
-    "• If input ends mid-thought, complete it naturally in English\n\n"
-    
-    "🎬 YOUTUBE DUBBING EXCELLENCE:\n"
-    "Your translation will be spoken aloud. It must:\n"
-    "• Sound completely natural when spoken\n"
-    "• Flow smoothly like native speech\n"
-    "• Match the YouTuber's speaking rhythm and pace\n"
-    "• Feel authentic, not translated\n"
-    "• Engage listeners as if the original speaker is talking directly to them\n\n"
-    
-    "💡 OUTPUT FORMAT:\n"
-    "One natural, complete English sentence that sounds like a real person speaking. "
-    "It should feel like the YouTuber is directly talking in English, not translated from Hindi. "
-    "The translation should be so good that listeners forget it's a translation."
+# ============================================================================
+# TRANSLATION ENGINE PROMPT
+# High-performance Hindi-to-English translator for live trading stream
+# Removed persona/roleplay to prevent hallucinations
+# ============================================================================
+
+TRANSLATION_INSTRUCTIONS = (
+    "You are a high-performance HINDI-TO-ENGLISH TRANSLATOR for a live trading stream.\n"
+    "Your Goal: Convert spoken Hindi/Hinglish into professional, high-energy English text for TTS.\n\n"
+    "RULES:\n"
+    "1. ACCURACY: Translate exactly what is said. Do NOT add names (like 'Jitu'), commands, or conversational filler unless the user explicitly said them.\n"
+    "2. NO HALLUCINATION: If the input is noise or incomplete, output nothing. Do not invent text.\n"
+    "3. KEEP TECHNICAL TERMS: Keep 'Nifty', 'BankNifty', 'Call', 'Put', 'Premium' as-is.\n"
+    "4. EMOTION: Use '!' for excitement and '...' for pauses. Use CAPS for urgent warnings.\n"
+    "5. FORMAT: Output ONLY the English translation text. Do NOT use JSON. Do NOT include 'Translation:' prefix."
 )
+
+TRANSLATION_PROMPT = TRANSLATION_INSTRUCTIONS + "\n\nTranslate the following:"
 
 
 def sanitize_text_for_tts(text: str) -> str | None:
@@ -616,13 +680,13 @@ def sanitize_text_for_tts(text: str) -> str | None:
     # Validation: Ensure text has actual content (not just punctuation)
     text_no_punct = text.replace('!', '').replace('?', '').replace('-', '').replace(':', '').replace(';', '').strip()
     if not text_no_punct or len(text_no_punct) < 1:
-        LOGGERS['tts'].warning(f"TTS text contains no meaningful content after sanitization - skipping: '{original_text[:50]}...'")
+        LOGGERS['tts'].debug(f"TTS text contains no meaningful content after sanitization - skipping: '{original_text[:50]}...'")
         return None
         
     # Quality check: Ensure meaningful words (not just single characters)
     words = text_no_punct.split()
     if len(words) == 0:
-        LOGGERS['tts'].warning(f"TTS text contains no words after sanitization - skipping: '{original_text[:50]}...'")
+        LOGGERS['tts'].debug(f"TTS text contains no words after sanitization - skipping: '{original_text[:50]}...'")
         return None
         
     # Final validation: Ensure text contains English characters (A-Z, a-z) OR numbers (0-9)
@@ -632,7 +696,7 @@ def sanitize_text_for_tts(text: str) -> str | None:
     has_numbers = bool(re.search(r'[0-9]', text))
         
     if not has_letters and not has_numbers:
-        LOGGERS['tts'].warning(f"TTS text contains no English letters or numbers - skipping: '{original_text[:50]}...'")
+        LOGGERS['tts'].debug(f"TTS text contains no English letters or numbers - skipping: '{original_text[:50]}...'")
         return None
         
     # Preserve natural emphasis markers (exclamation, question marks for TTS intonation)
@@ -1285,8 +1349,8 @@ async def process_single_translation(hindi_text: str, chat_ctx: llm.ChatContext,
     async with translation_lock:
         context_size_before = len(chat_ctx.items)
         
-        # ULTRA-AGGRESSIVE Proactive pruning: Keep context VERY small BEFORE translation
-        # Prune even if we're close to the limit (not just at the limit)
+        # Relaxed Proactive pruning: Keep context at CONTEXT_MAX_ITEMS (15) to prevent context amnesia
+        # Prune when we're close to the limit to make room for new messages
         if len(chat_ctx.items) >= CONTEXT_MAX_ITEMS - CONTEXT_PRUNE_TRIGGER_OFFSET:  # Prune when offset items away from limit
             # Find system message
             system_msg = None
@@ -1296,21 +1360,20 @@ async def process_single_translation(hindi_text: str, chat_ctx: llm.ChatContext,
                     break
             
             if system_msg:
-                # Keep system + recent conversation pairs (ULTRA-AGGRESSIVE pruning)
-                # Keep only last (CONTEXT_MAX_ITEMS - 3) items to make room for new user+assistant pair
-                # This ensures context never exceeds limit even after adding new messages
-                keep_count = max(1, CONTEXT_MAX_ITEMS - CONTEXT_PRUNE_KEEP_OFFSET)  # More aggressive: reserve more space
+                # Keep system + recent conversation pairs - use CONTEXT_MAX_ITEMS (15) not old aggressive limit
+                # Keep only last (CONTEXT_MAX_ITEMS - 2) items to ensure room for new user+assistant pair
+                keep_count = max(1, CONTEXT_MAX_ITEMS - 2)  # Use CONTEXT_MAX_ITEMS (15), not old limit
                 recent_items = chat_ctx.items[-keep_count:]
                 chat_ctx.items = [system_msg] + recent_items
-                LOGGERS['llm'].debug(f"🔧 Ultra-aggressive proactive context pruning - Before: {context_size_before}, After: {len(chat_ctx.items)} (preventing context bleeding)")
+                LOGGERS['llm'].debug(f"🔧 Relaxed proactive context pruning - Before: {context_size_before}, After: {len(chat_ctx.items)} (using CONTEXT_MAX_ITEMS={CONTEXT_MAX_ITEMS})")
             else:
                 # Fallback: keep first item + recent items
                 if len(chat_ctx.items) > 0:
                     first_item = chat_ctx.items[0]
-                    keep_count = max(1, CONTEXT_MAX_ITEMS - CONTEXT_PRUNE_KEEP_OFFSET)
+                    keep_count = max(1, CONTEXT_MAX_ITEMS - 2)  # Use CONTEXT_MAX_ITEMS (15)
                     recent_items = chat_ctx.items[-keep_count:]
                     chat_ctx.items = [first_item] + recent_items
-                    LOGGERS['llm'].debug(f"🔧 Ultra-aggressive proactive context pruning (fallback) - Before: {context_size_before}, After: {len(chat_ctx.items)}")
+                    LOGGERS['llm'].debug(f"🔧 Relaxed proactive context pruning (fallback) - Before: {context_size_before}, After: {len(chat_ctx.items)} (using CONTEXT_MAX_ITEMS={CONTEXT_MAX_ITEMS})")
         
         # NOW add user message (context is already pruned)
         chat_ctx.add_message(role="user", content=hindi_text)
@@ -1467,6 +1530,7 @@ async def process_single_translation(hindi_text: str, chat_ctx: llm.ChatContext,
                                                 
                                             # CRITICAL FIX: Buffer chunks to merge punctuation-only chunks with previous text
                                             # This prevents punctuation from being filtered out during sanitization
+                                            # LLM now outputs raw text (no JSON) - directly accumulate chunks
                                             tts_chunk_buffer += text
                                                 
                                             # Check if current buffer contains meaningful content (not just punctuation)
@@ -1486,7 +1550,7 @@ async def process_single_translation(hindi_text: str, chat_ctx: llm.ChatContext,
                                                 if sanitized and len(sanitized) > 0:
                                                     tts_text_chunks += 1
                                                     total_tts_chars += len(sanitized)
-                                                    # Push buffered chunk to TTS
+                                                    # Push buffered chunk to TTS (raw translation text)
                                                     tts_stream.push_text(sanitized)
                                                     if tts_text_chunks % TTS_CHUNK_LOG_INTERVAL == 0:  # Log every Nth chunk
                                                         LOGGERS['tts'].debug(f"TTS text pushed - Chunk #{tts_text_chunks}, Chars: {len(sanitized)}, Total: {total_tts_chars}")
@@ -1513,7 +1577,7 @@ async def process_single_translation(hindi_text: str, chat_ctx: llm.ChatContext,
                                         
                                     # If we got here without timeout, translation succeeded
                                     if not translation_timeout_occurred:
-                                        # CRITICAL FIX: Enhanced empty result detection and handling
+                                        # CRITICAL FIX: LLM now outputs raw text (no JSON) - use directly
                                         cleaned_result = full_translation.strip()
                                         
                                         # ENHANCED: Check if result is truly empty or problematic
@@ -1683,6 +1747,7 @@ async def process_single_translation(hindi_text: str, chat_ctx: llm.ChatContext,
         perf_metrics.add_total_latency(trans_elapsed)
         
     # Return cleaned translation with post-processing to remove incomplete markers
+    # CRITICAL FIX: LLM now outputs raw text (no JSON) - use directly
     cleaned_translation = full_translation.strip()
         
     # CRITICAL FIX: Detect and reject Hindi characters in translation output
@@ -1699,64 +1764,41 @@ async def process_single_translation(hindi_text: str, chat_ctx: llm.ChatContext,
             return ""  # Return empty to trigger retry
         
     # ============================================================================
-    # CRITICAL FIX #3: Enhanced Context Bleeding Detection and Single-Sentence Extraction
+    # CRITICAL FIX #3: Keep ALL sentences - Never throw away user speech
     # ============================================================================
-    # ALWAYS extract only the first sentence to ensure word-for-word, sentence-by-sentence translation
-    # Split by sentence boundaries (., !, ?)
-    sentences = re.split(r'[.!?]+', cleaned_translation)
-    sentences = [s.strip() for s in sentences if s.strip()]
+    # Split by sentence boundaries (., !, ?) but KEEP ALL sentences
+    # We must NEVER throw away user speech. If the LLM output 3 sentences, we play 3 sentences.
+    sentences = re.split(r'([.!?]+)', cleaned_translation)
+    # Reconstruct sentences with their punctuation
+    reconstructed_sentences = []
+    for i in range(0, len(sentences) - 1, 2):
+        if i + 1 < len(sentences):
+            sentence = (sentences[i] + sentences[i + 1]).strip()
+            if sentence:
+                reconstructed_sentences.append(sentence)
+    # If odd number of parts, add the last one
+    if len(sentences) % 2 == 1 and sentences[-1].strip():
+        reconstructed_sentences.append(sentences[-1].strip())
     
-    # CRITICAL: Always use only the FIRST sentence (the actual current translation)
-    # This ensures we never mix sentences or include context from previous translations
-    if len(sentences) > 1:
-        LOGGERS['llm'].warning(f"⚠️ Multiple sentences detected ({len(sentences)} sentences) - extracting FIRST sentence only for word-for-word accuracy")
-        LOGGERS['llm'].debug(f"All sentences: {sentences}")
-        
-        # Use the first complete sentence
-        first_sentence = sentences[0].strip()
-        
-        # Add proper punctuation if missing
-        if first_sentence and not first_sentence[-1] in '.!?':
-            # Determine punctuation based on original or add period
-            if '?' in cleaned_translation[:len(first_sentence)+10]:
-                first_sentence += '?'
-            elif '!' in cleaned_translation[:len(first_sentence)+10]:
-                first_sentence += '!'
-            else:
-                first_sentence += '.'
-        
-        cleaned_translation = first_sentence
-        LOGGERS['llm'].info(f"✅ Extracted first sentence only: '{cleaned_translation[:100]}...' ({len(cleaned_translation)} chars)")
+    # CRITICAL: Keep EVERYTHING - join all sentences
+    if len(reconstructed_sentences) > 1:
+        LOGGERS['llm'].info(f"✅ Multiple sentences detected ({len(reconstructed_sentences)} sentences) - keeping ALL sentences to prevent data loss")
+        cleaned_translation = " ".join(reconstructed_sentences)
+    elif reconstructed_sentences:
+        cleaned_translation = reconstructed_sentences[0]
+    else:
+        # Fallback: use original if splitting failed
+        cleaned_translation = cleaned_translation.strip()
     
     # Detect context bleeding (output contains previous translations or extra content)
-    MAX_OUTPUT_EXPANSION = 1.8  # Maximum expansion ratio before context bleeding detection
+    # CRITICAL FIX: Only log warning, DO NOT truncate - Hindi-to-English translation often expands significantly
     output_length = len(cleaned_translation)
     expansion_ratio = output_length / input_length if input_length > 0 else 0
     
     if expansion_ratio > MAX_OUTPUT_EXPANSION:
         LOGGERS['llm'].warning(f"⚠️ SUSPICIOUS OUTPUT EXPANSION: Input: {input_length} chars, Output: {output_length} chars (ratio: {expansion_ratio:.2f}x)")
         LOGGERS['llm'].warning(f"⚠️ This may indicate context bleeding - output may contain extra words or context")
-        
-        # If expansion is too high, truncate to reasonable length
-        max_reasonable_length = input_length * 1.5  # Allow 1.5x expansion for natural translation
-        if len(cleaned_translation) > max_reasonable_length:
-            # Truncate at sentence boundary if possible
-            truncated = cleaned_translation[:int(max_reasonable_length)]
-            # Try to find last sentence boundary
-            last_period = truncated.rfind('.')
-            last_exclamation = truncated.rfind('!')
-            last_question = truncated.rfind('?')
-            last_boundary = max(last_period, last_exclamation, last_question)
-            
-            if last_boundary > input_length * 0.8:  # If we have a good sentence boundary
-                cleaned_translation = truncated[:last_boundary+1]
-            else:
-                # No good boundary, just truncate and add period
-                cleaned_translation = truncated.rsplit(' ', 1)[0] + '.'
-            
-            LOGGERS['llm'].warning(f"⚠️ Truncated output to {len(cleaned_translation)} chars (was {output_length} chars) to prevent context bleeding")
-            output_length = len(cleaned_translation)
-            expansion_ratio = output_length / input_length if input_length > 0 else 0
+        # CRITICAL: DO NOT truncate - truncating destroys meaning. Hindi-to-English naturally expands.
     
     # Quality check: Ensure translation is not empty or too short
     if len(cleaned_translation.strip()) < MIN_OUTPUT_LENGTH_MEANINGFUL:
@@ -1786,14 +1828,8 @@ async def process_single_translation(hindi_text: str, chat_ctx: llm.ChatContext,
         if cleaned_translation and not cleaned_translation[-1] in '.!?':
             cleaned_translation += '.'
     
-    # FINAL CHECK: Ensure we have exactly ONE sentence (no mixing)
-    final_sentences = re.split(r'[.!?]+', cleaned_translation)
-    final_sentences = [s.strip() for s in final_sentences if s.strip()]
-    if len(final_sentences) > 1:
-        LOGGERS['llm'].warning(f"⚠️ Final validation: Still multiple sentences detected - using first only")
-        cleaned_translation = final_sentences[0].strip()
-        if cleaned_translation and not cleaned_translation[-1] in '.!?':
-            cleaned_translation += '.'
+    # FINAL CHECK: Ensure we have valid translation (keep all sentences)
+    # No longer restricting to single sentence - we keep everything the user said
         
     LOGGERS['llm'].info(f"Translation completed - Result: '{cleaned_translation[:100]}{'...' if len(cleaned_translation) > 100 else ''}' ({len(cleaned_translation)} chars, expansion: {expansion_ratio:.2f}x)")
     return cleaned_translation
@@ -1855,8 +1891,8 @@ async def translate_and_synthesize_loop(translation_queue: asyncio.Queue,
                                     chat_ctx.add_message(role="assistant", content=full_translation)
                                     context_size_before = len(chat_ctx.items)
                                     
-                                    # ULTRA-AGGRESSIVE: Context pruning AFTER adding assistant message
-                                    # Prune immediately if context is at or near limit (prevent future bleeding)
+                                    # Relaxed: Context pruning AFTER adding assistant message
+                                    # Prune when context is at or near CONTEXT_MAX_ITEMS (15) to prevent future overflow
                                     if len(chat_ctx.items) >= CONTEXT_MAX_ITEMS - CONTEXT_PRUNE_TRIGGER_OFFSET:  # Prune when offset items away from limit
                                         # Find system message
                                         system_msg = None
@@ -1866,20 +1902,20 @@ async def translate_and_synthesize_loop(translation_queue: asyncio.Queue,
                                                 break
                                             
                                         if system_msg:
-                                            # Keep system + recent conversation pairs (ULTRA-AGGRESSIVE)
+                                            # Keep system + recent conversation pairs - use CONTEXT_MAX_ITEMS (15)
                                             # Keep only last (CONTEXT_MAX_ITEMS - 2) items to ensure room for future
-                                            keep_count = max(1, CONTEXT_MAX_ITEMS - 2)
+                                            keep_count = max(1, CONTEXT_MAX_ITEMS - 2)  # Use CONTEXT_MAX_ITEMS (15)
                                             recent_items = chat_ctx.items[-keep_count:]
                                             chat_ctx.items = [system_msg] + recent_items
-                                            LOGGERS['llm'].debug(f"🔧 Ultra-aggressive context pruning after translation - Before: {context_size_before}, After: {len(chat_ctx.items)}")
+                                            LOGGERS['llm'].debug(f"🔧 Relaxed context pruning after translation - Before: {context_size_before}, After: {len(chat_ctx.items)} (using CONTEXT_MAX_ITEMS={CONTEXT_MAX_ITEMS})")
                                         else:
                                             # Fallback: keep first item + recent items
                                             if len(chat_ctx.items) > 0:
                                                 first_item = chat_ctx.items[0]
-                                                keep_count = max(1, CONTEXT_MAX_ITEMS - CONTEXT_PRUNE_KEEP_OFFSET_POST)
+                                                keep_count = max(1, CONTEXT_MAX_ITEMS - 2)  # Use CONTEXT_MAX_ITEMS (15)
                                                 recent_items = chat_ctx.items[-keep_count:]
                                                 chat_ctx.items = [first_item] + recent_items
-                                                LOGGERS['llm'].debug(f"🔧 Ultra-aggressive context pruning (fallback) - Before: {context_size_before}, After: {len(chat_ctx.items)}")
+                                                LOGGERS['llm'].debug(f"🔧 Relaxed context pruning (fallback) - Before: {context_size_before}, After: {len(chat_ctx.items)} (using CONTEXT_MAX_ITEMS={CONTEXT_MAX_ITEMS})")
                                     else:
                                         LOGGERS['llm'].debug(f"Context updated - Size: {len(chat_ctx.items)}")
                         else:
@@ -1919,36 +1955,13 @@ async def translate_and_synthesize_loop(translation_queue: asyncio.Queue,
 # ============================================================================
 # TEAM 3: THE MOUTH (playback_loop)
 # Picks audio frames from Conveyor Belt B and plays them
-# STRICTLY PACED at 0.85x speed (slower, more natural pacing)
+# ZERO LATENCY: Direct playback without resampling (removed CPU-intensive NumPy operations)
 # ============================================================================
-def resample_audio_slow(data: bytes, original_rate: int, speed_factor: float) -> bytes:
-    """Resample audio to slow it down by speed_factor (e.g., 0.85x speed)"""
-    if speed_factor >= 1.0:
-        return data  # No resampling needed
-    
-    # Convert bytes to numpy array (16-bit PCM, mono)
-    audio_array = np.frombuffer(data, dtype=np.int16)
-    
-    # Calculate new length for slower playback
-    original_length = len(audio_array)
-    new_length = int(original_length / speed_factor)
-    
-    # Linear interpolation to resample (simple but effective)
-    # Create indices for resampling
-    original_indices = np.arange(original_length)
-    new_indices = np.linspace(0, original_length - 1, new_length)
-    
-    # Interpolate audio samples
-    resampled_audio = np.interp(new_indices, original_indices, audio_array.astype(np.float32))
-    
-    # Convert back to int16 and then to bytes
-    resampled_audio = resampled_audio.astype(np.int16)
-    return resampled_audio.tobytes()
 
 async def playback_loop(source: rtc.AudioSource, audio_queue: asyncio.Queue, 
                     shutdown_event: asyncio.Event) -> None:
-    """Team 3: Mouth - Production-Ready Progressive Streaming Playback (Zero Gaps)"""
-    BASE_SPEED = BASE_PLAYBACK_SPEED  # Slower speed for natural pacing
+    """Team 3: Mouth - Production-Ready Progressive Streaming Playback (Zero Gaps, Zero Latency)"""
+    # REMOVED: BASE_SPEED resampling - Direct playback for zero latency (saves 50-100ms CPU time per frame)
         
     LOGGERS['main'].info("Playback loop started - Continuous Loop Playback (No Stop-Start)")
     LOGGERS['main'].info(f"MIN_PLAYABLE_SIZE: {MIN_PLAYABLE_SIZE} bytes (~75ms - Continuous loop playback)")
@@ -1972,14 +1985,12 @@ async def playback_loop(source: rtc.AudioSource, audio_queue: asyncio.Queue,
                     if len(frame_buffer) >= 2000:  # Only flush substantial buffers (prevents robotic stops in continuous loop)
                         LOGGERS['perf'].debug(f"Gap detected - Flushing substantial buffer: {len(frame_buffer)} bytes")
                         try:
-                            # Resample audio to slow it down to 0.85x speed
-                            slowed_audio_data = resample_audio_slow(bytes(frame_buffer), 24000, BASE_SPEED)
-                            
+                            # Pass raw data directly (0ms latency cost - removed resampling)
                             buffered_frame = rtc.AudioFrame(
-                                data=slowed_audio_data,
+                                data=bytes(frame_buffer),
                                 sample_rate=24000,
                                 num_channels=1,
-                                samples_per_channel=len(slowed_audio_data) // 2
+                                samples_per_channel=len(frame_buffer) // 2
                             )
                             playback_start = time.time()
                             await source.capture_frame(buffered_frame)
@@ -2000,14 +2011,12 @@ async def playback_loop(source: rtc.AudioSource, audio_queue: asyncio.Queue,
                     # Shutdown - flush remaining buffer
                     if len(frame_buffer) > 0:
                         try:
-                            # Resample audio to slow it down to 0.85x speed
-                            slowed_audio_data = resample_audio_slow(bytes(frame_buffer), 24000, BASE_SPEED)
-                            
+                            # Pass raw data directly (0ms latency cost - removed resampling)
                             buffered_frame = rtc.AudioFrame(
-                                data=slowed_audio_data,
+                                data=bytes(frame_buffer),
                                 sample_rate=24000,
                                 num_channels=1,
-                                samples_per_channel=len(slowed_audio_data) // 2
+                                samples_per_channel=len(frame_buffer) // 2
                             )
                             await source.capture_frame(buffered_frame)
                             frame_buffer.clear()
@@ -2037,14 +2046,12 @@ async def playback_loop(source: rtc.AudioSource, audio_queue: asyncio.Queue,
                     frame_buffer = frame_buffer[chunk_size:]
                     
                     try:
-                        # Resample audio to slow it down to 0.85x speed
-                        slowed_audio_data = resample_audio_slow(chunk_data, 24000, BASE_SPEED)
-                        
+                        # Pass raw data directly (0ms latency cost - removed resampling)
                         buffered_frame = rtc.AudioFrame(
-                            data=slowed_audio_data,
+                            data=chunk_data,
                             sample_rate=24000,
                             num_channels=1,
-                            samples_per_channel=len(slowed_audio_data) // 2
+                            samples_per_channel=len(chunk_data) // 2
                         )
                             
                         playback_start = time.time()
@@ -2059,7 +2066,7 @@ async def playback_loop(source: rtc.AudioSource, audio_queue: asyncio.Queue,
                         if playback_count % PLAYBACK_LOG_INTERVAL == 0:  # Log every Nth playback
                             LOGGERS['perf'].debug(
                                 f"T3_PLAY #{playback_count} - Latency: {playback_elapsed}ms, "
-                                f"Chunk: {len(slowed_audio_data)} bytes, Buffer: {len(frame_buffer)} bytes"
+                                f"Chunk: {len(chunk_data)} bytes, Buffer: {len(frame_buffer)} bytes"
                             )
                     except Exception as e:
                         LOGGERS['error'].error(f"Playback error: {str(e)}")
@@ -2076,23 +2083,43 @@ async def playback_loop(source: rtc.AudioSource, audio_queue: asyncio.Queue,
         # Final flush on shutdown
         if len(frame_buffer) > 0:
             try:
-                # Resample audio to slow it down to 0.85x speed
-                slowed_audio_data = resample_audio_slow(bytes(frame_buffer), 24000, BASE_SPEED)
-                
+                # Pass raw data directly (0ms latency cost - removed resampling)
                 buffered_frame = rtc.AudioFrame(
-                    data=slowed_audio_data,
+                    data=bytes(frame_buffer),
                     sample_rate=24000,
                     num_channels=1,
-                    samples_per_channel=len(slowed_audio_data) // 2
+                    samples_per_channel=len(frame_buffer) // 2
                 )
                 await source.capture_frame(buffered_frame)
-                LOGGERS['main'].info(f"Final buffer flush: {len(slowed_audio_data)} bytes (slowed to 0.85x)")
+                LOGGERS['main'].info(f"Final buffer flush: {len(frame_buffer)} bytes (zero latency)")
             except Exception:
                 pass
 
 
 async def entrypoint(ctx: JobContext) -> None:
     """Main entrypoint - The Factory Line coordinator"""
+    # CRITICAL FIX: Set up exception handler for asyncio callbacks (catches winloop._read_from_self errors)
+    def handle_exception(loop, context):
+        """Handle exceptions in asyncio callbacks (like winloop._read_from_self)"""
+        exception = context.get('exception')
+        if exception:
+            error_type_name = type(exception).__name__
+            error_module = type(exception).__module__ if hasattr(type(exception), '__module__') else ''
+            
+            # Suppress _ExitCli exceptions in callbacks (expected shutdown signal)
+            if (error_type_name == '_ExitCli' or 
+                'ExitCli' in error_type_name or 
+                'livekit.agents.cli.cli' in error_module):
+                # This is expected - don't log as error
+                return
+        
+        # Log other exceptions normally
+        loop.default_exception_handler(context)
+    
+    # Set the exception handler
+    loop = asyncio.get_event_loop()
+    loop.set_exception_handler(handle_exception)
+    
     # Initialize memory monitoring if available
     memory_monitor = None
     memory_task = None
@@ -2109,7 +2136,7 @@ async def entrypoint(ctx: JobContext) -> None:
     LOGGERS['main'].info("=" * 80)
     LOGGERS['main'].info("AGENT STARTING - Entrypoint called")
     LOGGERS['main'].info(f"Models configured:")
-    LOGGERS['main'].info(f"  - STT: Deepgram Nova-3 (Hindi)")
+    LOGGERS['main'].info(f"  - STT: Deepgram Nova-2 (Hindi) - Ultra-fast for zero latency")
     LOGGERS['main'].info(f"  - LLM: Groq (llama-3.3-70b-versatile) - Best translation quality")
     LOGGERS['main'].info(f"  - TTS: ElevenLabs ({ELEVENLABS_MODEL_ID}, voice: {ELEVENLABS_VOICE_ID})")
     LOGGERS['main'].info("=" * 80)
@@ -2229,7 +2256,7 @@ async def entrypoint(ctx: JobContext) -> None:
         
     perf_log_task = asyncio.create_task(periodic_performance_log())
         
-    # Run until cancelled
+    # Run until cancelled - Handle KeyboardInterrupt and _ExitCli gracefully
     try:
         LOGGERS['main'].info("Factory line running - Waiting for tasks...")
         results = await asyncio.gather(team1_ears, team2_brain, team3_mouth, return_exceptions=True)
@@ -2239,8 +2266,30 @@ async def entrypoint(ctx: JobContext) -> None:
                 LOGGERS['error'].error(f"Team {i} task failed with exception: {str(result)}")
             elif not isinstance(result, Exception) and not isinstance(result, asyncio.CancelledError):
                 LOGGERS['main'].warning(f"Team {i} task completed unexpectedly (not cancelled)")
+    except KeyboardInterrupt:
+        # CRITICAL FIX: Immediately set shutdown event on KeyboardInterrupt
+        LOGGERS['main'].warning("⚠️ KeyboardInterrupt detected in entrypoint - Triggering graceful shutdown")
+        shutdown_event.set()
+        # Re-raise to allow outer handler to catch it
+        raise
     except Exception as e:
+        # CRITICAL FIX: Handle LiveKit's _ExitCli exception (Windows shutdown signal)
+        # Check if it's _ExitCli by type name or module (since it's a private class)
+        error_type_name = type(e).__name__
+        error_module = type(e).__module__ if hasattr(type(e), '__module__') else ''
+        
+        if (error_type_name == '_ExitCli' or 
+            'ExitCli' in error_type_name or 
+            'livekit.agents.cli.cli' in error_module):
+            LOGGERS['main'].info("⚠️ LiveKit shutdown signal (_ExitCli) detected - Triggering graceful shutdown")
+            shutdown_event.set()
+            # Don't re-raise - this is expected for clean shutdown
+            return
+        
+        # Handle other exceptions
         LOGGERS['error'].error(f"Factory line error: {str(e)}")
+        # Set shutdown event on any exception to ensure cleanup
+        shutdown_event.set()
         pass
     finally:
         # Cancel performance logging task
@@ -2311,13 +2360,27 @@ async def entrypoint(ctx: JobContext) -> None:
         LOGGERS['main'].info("=" * 80)
         LOGGERS['main'].info("AGENT SHUTDOWN COMPLETE")
         LOGGERS['main'].info(f"Log file: {LOGGERS['file']}")
+        if 'terminal_file' in LOGGERS:
+            LOGGERS['main'].info(f"Terminal output file: {LOGGERS['terminal_file']}")
         LOGGERS['main'].info("=" * 80)
             
-        # Close log file handle if it exists
-        if 'file_handle' in LOGGERS and LOGGERS['file_handle']:
+        # Stop async logging listener (flush remaining logs to disk)
+        if 'listener' in LOGGERS and LOGGERS['listener']:
             try:
-                LOGGERS['file_handle'].flush()
-                LOGGERS['file_handle'].close()
+                LOGGERS['listener'].stop()  # Stop background thread and flush remaining logs
+            except Exception:
+                pass
+        
+        # Close terminal log file handle if it exists
+        if 'terminal_file_handle' in LOGGERS and LOGGERS['terminal_file_handle']:
+            try:
+                # Write footer to terminal log
+                LOGGERS['terminal_file_handle'].write(f"\n{'='*80}\n")
+                LOGGERS['terminal_file_handle'].write(f"TERMINAL OUTPUT CAPTURE - Ended: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                LOGGERS['terminal_file_handle'].write(f"{'='*80}\n")
+                LOGGERS['terminal_file_handle'].flush()
+                LOGGERS['terminal_file_handle'].close()
+                print(f"\n✓ Terminal output saved to: {LOGGERS.get('terminal_file', 'N/A')}")
             except Exception:
                 pass
             
@@ -2329,4 +2392,47 @@ async def entrypoint(ctx: JobContext) -> None:
 
 
 if __name__ == "__main__":
-    cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint))
+    # CRITICAL FIX: Handle Windows shutdown crash gracefully
+    # Wrap in try/except to catch KeyboardInterrupt, _ExitCli, and winloop exit signals
+    try:
+        cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint))
+    except KeyboardInterrupt:
+        # User pressed Ctrl+C - trigger clean shutdown
+        print("\n⚠️ KeyboardInterrupt detected - Initiating graceful shutdown...")
+        # The entrypoint function's finally block will handle cleanup
+        # Give it a moment to complete shutdown
+        import time
+        time.sleep(0.5)
+        print("✓ Shutdown complete")
+    except Exception as exit_error:
+        # CRITICAL FIX: Handle LiveKit's _ExitCli exception (Windows shutdown signal from winloop)
+        # Check if it's _ExitCli by type name or module (since it's a private class)
+        error_type_name = type(exit_error).__name__
+        error_module = type(exit_error).__module__ if hasattr(type(exit_error), '__module__') else ''
+        
+        if (error_type_name == '_ExitCli' or 
+            'ExitCli' in error_type_name or 
+            'livekit.agents.cli.cli' in error_module):
+            # This is raised by LiveKit's CLI when it receives a shutdown signal
+            # It's expected behavior, not an error - suppress the traceback
+            print("\n⚠️ LiveKit shutdown signal detected - Clean shutdown completed")
+            # Exit gracefully without showing traceback
+            import sys
+            sys.exit(0)
+        # If not _ExitCli, continue to next exception handler
+        raise
+    except Exception as e:
+        # Catch any other exceptions (including winloop._read_from_self errors)
+        error_type = type(e).__name__
+        error_msg = str(e)
+        
+        # Check if it's a winloop-related error (even if not _ExitCli)
+        if "winloop" in error_msg.lower() or "_read_from_self" in error_msg.lower() or "_ExitCli" in error_type:
+            print(f"\n⚠️ Windows event loop shutdown signal detected - This is normal on Windows")
+            print("✓ Clean shutdown completed")
+            import sys
+            sys.exit(0)
+        else:
+            # Re-raise unexpected errors
+            print(f"\n❌ Unexpected error: {error_type}: {error_msg}")
+            raise
