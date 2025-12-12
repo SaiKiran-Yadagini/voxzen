@@ -34,8 +34,6 @@ import time
 import re
 import numpy as np
 import logging
-import logging.handlers
-import queue
 from datetime import datetime
 from contextlib import asynccontextmanager
 from dotenv import load_dotenv
@@ -110,104 +108,8 @@ except ImportError as e:
 load_dotenv()
 
 # ============================================================================
-# PRE-COMPILED REGEX PATTERNS (Performance Optimization)
-# ============================================================================
-# Pre-compiling regex patterns saves ~5ms CPU per chunk by avoiding re-compilation
-# These patterns are used frequently in text sanitization and validation
-RE_HINDI = re.compile(r'[\u0900-\u097F]+')  # Devanagari script (Hindi)
-RE_NON_ASCII = re.compile(r'[^\x00-\x7F\s]')  # Non-ASCII characters (except spaces)
-RE_MULTI_COMMA = re.compile(r'[,]{2,}')  # Multiple consecutive commas
-RE_MULTI_EXCLAMATION = re.compile(r'[!]{2,}')  # Multiple consecutive exclamations
-RE_MULTI_QUESTION = re.compile(r'[?]{2,}')  # Multiple consecutive questions
-RE_ENGLISH_LETTERS = re.compile(r'[A-Za-z]')  # English letters
-RE_NUMBERS = re.compile(r'[0-9]')  # Numbers
-RE_CLEAN_TEXT = re.compile(r'[^\w\s]')  # Non-word, non-space characters
-RE_ELLIPSIS_DOTS = re.compile(r'\.{3,}')  # Three or more dots
-RE_ELLIPSIS_CHAR = re.compile(r'…{2,}')  # Multiple ellipsis characters
-RE_PROBLEMATIC_UNICODE = re.compile(r'[\u200B-\u200D\uFEFF\u00AD]')  # Zero-width and problematic Unicode
-
-# ============================================================================
 # PERFORMANCE METRICS TRACKING
 # ============================================================================
-class PerformanceMetrics:
-    """Track and analyze performance metrics for the pipeline"""
-    def __init__(self):
-        self.stt_latencies = []
-        self.llm_latencies = []
-        self.tts_latencies = []
-        self.total_latencies = []
-        self.max_samples = 100  # Keep last 100 samples for analysis
-            
-    def add_stt_latency(self, latency_ms: float):
-        """Add STT latency measurement"""
-        if PERF_METRICS_ENABLED and latency_ms > 0:
-            self.stt_latencies.append(latency_ms)
-            if len(self.stt_latencies) > self.max_samples:
-                self.stt_latencies.pop(0)
-            # Alert on high latency
-            if latency_ms > LATENCY_ALERT_THRESHOLD_MS:
-                logging.getLogger("PERFORMANCE").warning(f"High STT latency detected: {latency_ms:.0f}ms (threshold: {LATENCY_ALERT_THRESHOLD_MS}ms)")
-        
-    def add_llm_latency(self, latency_ms: float):
-        """Add LLM latency measurement"""
-        if PERF_METRICS_ENABLED and latency_ms > 0:
-            self.llm_latencies.append(latency_ms)
-            if len(self.llm_latencies) > self.max_samples:
-                self.llm_latencies.pop(0)
-        
-    def add_tts_latency(self, latency_ms: float):
-        """Add TTS latency measurement"""
-        if PERF_METRICS_ENABLED and latency_ms > 0:
-            self.tts_latencies.append(latency_ms)
-            if len(self.tts_latencies) > self.max_samples:
-                self.tts_latencies.pop(0)
-        
-    def add_total_latency(self, latency_ms: float):
-        """Add total pipeline latency measurement"""
-        if PERF_METRICS_ENABLED and latency_ms > 0:
-            self.total_latencies.append(latency_ms)
-            if len(self.total_latencies) > self.max_samples:
-                self.total_latencies.pop(0)
-        
-    def get_stats(self, latencies: list) -> dict:
-        """Calculate statistics for a latency list with comprehensive percentiles"""
-        if not latencies:
-            return {"count": 0, "avg": 0, "min": 0, "max": 0, "p50": 0, "p90": 0, "p95": 0, "p99": 0}
-        sorted_latencies = sorted(latencies)
-        count = len(sorted_latencies)
-        return {
-            "count": count,
-            "avg": sum(sorted_latencies) / count,
-            "min": sorted_latencies[0],
-            "max": sorted_latencies[-1],
-            "p50": sorted_latencies[int(count * 0.50)],
-            "p90": sorted_latencies[int(count * 0.90)] if count > 1 else sorted_latencies[0],
-            "p95": sorted_latencies[int(count * 0.95)] if count > 1 else sorted_latencies[0],
-            "p99": sorted_latencies[int(count * 0.99)] if count > 1 else sorted_latencies[0],
-        }
-        
-    def log_summary(self):
-        """Log performance summary"""
-        if not PERF_METRICS_ENABLED:
-            return
-            
-        perf_logger = logging.getLogger("PERFORMANCE")
-        stt_stats = self.get_stats(self.stt_latencies)
-        llm_stats = self.get_stats(self.llm_latencies)
-        tts_stats = self.get_stats(self.tts_latencies)
-        total_stats = self.get_stats(self.total_latencies)
-            
-        if stt_stats["count"] > 0:
-            perf_logger.info(f"STT Stats: count={stt_stats['count']}, avg={stt_stats['avg']:.0f}ms, p50={stt_stats['p50']:.0f}ms, p90={stt_stats['p90']:.0f}ms, p95={stt_stats['p95']:.0f}ms, p99={stt_stats['p99']:.0f}ms")
-        if llm_stats["count"] > 0:
-            perf_logger.info(f"LLM Stats: count={llm_stats['count']}, avg={llm_stats['avg']:.0f}ms, p50={llm_stats['p50']:.0f}ms, p90={llm_stats['p90']:.0f}ms, p95={llm_stats['p95']:.0f}ms")
-        if tts_stats["count"] > 0:
-            perf_logger.info(f"TTS Stats: count={tts_stats['count']}, avg={tts_stats['avg']:.0f}ms, p50={tts_stats['p50']:.0f}ms, p90={tts_stats['p90']:.0f}ms, p95={tts_stats['p95']:.0f}ms")
-        if total_stats["count"] > 0:
-            perf_logger.info(f"Total Stats: count={total_stats['count']}, avg={total_stats['avg']:.0f}ms, p50={total_stats['p50']:.0f}ms, p90={total_stats['p90']:.0f}ms, p95={total_stats['p95']:.0f}ms")
-
-# Global performance metrics instance
-perf_metrics = PerformanceMetrics()
 
 # ============================================================================
 # LOGGING SETUP - Detailed logs for all models
@@ -228,75 +130,8 @@ class MicrosecondFormatter(logging.Formatter):
             s = "%s,%03d" % (t, record.msecs)
         return s
 
-class TeeStream:
-    """Stream that writes to both console and log file - Captures EVERYTHING"""
-    def __init__(self, console_stream, log_file, terminal_log_file):
-        self.console_stream = console_stream
-        self.log_file = log_file  # Main log file (structured logs)
-        self.terminal_log_file = terminal_log_file  # Raw terminal output file
-        self.logger = logging.getLogger("TERMINAL_OUTPUT")
-        self.buffer = ""  # Buffer for incomplete lines
-        
-    def write(self, text):
-        """Write to both console and ALL log files - Captures EVERYTHING including empty lines"""
-        if not text:
-            return
-            
-        # Write to console immediately
-        try:
-            self.console_stream.write(text)
-            self.console_stream.flush()
-        except Exception:
-            pass  # Ignore console write errors
-        
-        # Add to buffer (handle partial lines)
-        self.buffer += text
-        
-        # Process complete lines
-        while '\n' in self.buffer:
-            line, self.buffer = self.buffer.split('\n', 1)
-            line += '\n'  # Add back the newline
-            
-            # Note: Main log file writes are now handled by async logging (non-blocking)
-            # Write to raw terminal log file (exact terminal output)
-            try:
-                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-                self.terminal_log_file.write(f"[{timestamp}] {line}")
-                self.terminal_log_file.flush()
-            except Exception:
-                pass  # Ignore terminal log write errors
-        
-        # If buffer has content but no newline, flush it anyway (for incomplete output)
-        if self.buffer and len(self.buffer) > 1000:  # Flush large buffers
-            try:
-                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-                self.log_file.write(f"{timestamp} | TERMINAL | {self.buffer}")
-                self.log_file.flush()
-                self.terminal_log_file.write(f"[{timestamp}] {self.buffer}")
-                self.terminal_log_file.flush()
-                self.buffer = ""
-            except Exception:
-                pass
-        
-    def flush(self):
-        """Flush all streams"""
-        try:
-            self.console_stream.flush()
-        except Exception:
-            pass
-        # Note: Main log file flushing is handled by async logging listener
-        try:
-            if self.terminal_log_file:
-                self.terminal_log_file.flush()
-        except Exception:
-            pass
-        
-    def isatty(self):
-        """Return True to maintain compatibility"""
-        return self.console_stream.isatty()
-
 def setup_logging():
-    """200 IQ Optimization: Non-blocking Async Logging - Decouples CPU from Disk I/O"""
+    """Setup standard Python logging"""
     # Create logs directory if it doesn't exist
     log_dir = "logs"
     os.makedirs(log_dir, exist_ok=True)
@@ -305,64 +140,30 @@ def setup_logging():
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_file_path = os.path.join(log_dir, f"agent_log_{timestamp}.log")
         
-    # Create separate terminal output file (raw terminal capture)
-    terminal_log_file_path = os.path.join(log_dir, f"terminal_output_{timestamp}.log")
+    # Configure root logger
+    root = logging.getLogger()
+    root.setLevel(logging.DEBUG)
     
-    # Open terminal log file for TeeStream (still needed for print() capture)
-    terminal_log_file_handle = open(terminal_log_file_path, 'a', encoding='utf-8')
-        
-    # Write header to terminal log file
-    terminal_log_file_handle.write(f"{'='*80}\n")
-    terminal_log_file_handle.write(f"TERMINAL OUTPUT CAPTURE - Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-    terminal_log_file_handle.write(f"File: {terminal_log_file_path}\n")
-    terminal_log_file_handle.write(f"{'='*80}\n\n")
-    terminal_log_file_handle.flush()
-        
-    # ============================================================================
-    # ASYNC LOGGING SETUP (Non-blocking file writes)
-    # ============================================================================
-    # 1. Create the Slow File Handler (but don't attach to root yet)
+    # Remove existing handlers to avoid duplicates
+    if root.handlers:
+        root.handlers.clear()
+    
+    # File handler for log file
     file_handler = logging.FileHandler(log_file_path, mode='a', encoding='utf-8')
     file_formatter = MicrosecondFormatter(
         '%(asctime)s | %(levelname)-8s | %(name)-20s | %(message)s',
         '%Y-%m-%d %H:%M:%S.%f'
     )
     file_handler.setFormatter(file_formatter)
-    file_handler.setLevel(logging.DEBUG)  # Capture everything
+    file_handler.setLevel(logging.DEBUG)
+    root.addHandler(file_handler)
     
-    # 2. Create a Fast Memory Queue (Infinite size - no blocking)
-    log_queue = queue.Queue(-1)
-        
-    # 3. Create the QueueHandler (The Main Thread will use ONLY this - instant writes)
-    queue_handler = logging.handlers.QueueHandler(log_queue)
-    
-    # 4. Create the Listener (Runs in a background thread to handle disk I/O)
-    listener = logging.handlers.QueueListener(log_queue, file_handler)
-    listener.start()  # Start background thread for async file writes
-    
-    # 5. Configure Root Logger to use the Fast Queue
-    root = logging.getLogger()
-    root.setLevel(logging.DEBUG)
-    # Remove existing handlers to avoid duplicates
-    if root.handlers:
-        root.handlers.clear()
-    root.addHandler(queue_handler)  # Fast queue handler (non-blocking)
-    
-    # 6. Console handler (separate - for immediate terminal output)
+    # Console handler for terminal output
     console_handler = logging.StreamHandler()
     console_handler.setLevel(logging.INFO)
     console_formatter = logging.Formatter('%(asctime)s | %(levelname)-8s | %(message)s', '%H:%M:%S')
     console_handler.setFormatter(console_formatter)
     root.addHandler(console_handler)
-        
-    # CRITICAL: Redirect stdout and stderr to capture ALL print() statements and terminal output
-    # Create TeeStream that writes to console and terminal log file (but NOT main log file - that's async)
-    tee_stdout = TeeStream(sys.stdout, None, terminal_log_file_handle)  # No main log file in TeeStream (handled by async logging)
-    tee_stderr = TeeStream(sys.stderr, None, terminal_log_file_handle)
-        
-    # Replace stdout and stderr
-    sys.stdout = tee_stdout
-    sys.stderr = tee_stderr
         
     # Create specific loggers for each model
     stt_logger = logging.getLogger("STT_DEEPGRAM")
@@ -371,26 +172,12 @@ def setup_logging():
     queue_logger = logging.getLogger("QUEUE")
     perf_logger = logging.getLogger("PERFORMANCE")
     error_logger = logging.getLogger("ERROR")
-    terminal_logger = logging.getLogger("TERMINAL_OUTPUT")
         
     # Log initialization
     root.info(f"=" * 80)
     root.info(f"LOGGING INITIALIZED - Log file: {log_file_path}")
-    root.info(f"TERMINAL OUTPUT FILE: {terminal_log_file_path}")
     root.info(f"Models: Deepgram STT (nova-2), Groq LLM (llama-3.1-8b-instant), ElevenLabs TTS (flash_v2_5)")
-    root.info(f"🚀 ASYNC LOGGING ACTIVE - Non-blocking file writes (50-100ms latency saved)")
-    root.info(f"ALL terminal output (including print statements) will be captured in BOTH log files")
-    root.info(f"  - Main log: {log_file_path} (structured logs - async writes)")
-    root.info(f"  - Terminal log: {terminal_log_file_path} (raw terminal output)")
     root.info(f"=" * 80)
-    
-    # Print to terminal (will be captured)
-    print(f"\n{'='*80}")
-    print(f"🚀 ASYNC LOGGING ACTIVE - Non-blocking file writes")
-    print(f"✓ LOGGING ACTIVE - All terminal output is being saved")
-    print(f"  Main log: {log_file_path}")
-    print(f"  Terminal log: {terminal_log_file_path}")
-    print(f"{'='*80}\n")
         
     return {
         'main': root,
@@ -400,11 +187,7 @@ def setup_logging():
         'queue': queue_logger,
         'perf': perf_logger,
         'error': error_logger,
-        'terminal': terminal_logger,
-        'file': log_file_path,
-        'terminal_file': terminal_log_file_path,
-        'terminal_file_handle': terminal_log_file_handle,
-        'listener': listener  # Return listener so we can stop it on shutdown
+        'file': log_file_path
     }
 
 # Initialize logging
@@ -428,17 +211,19 @@ MAIN_LLM = GROQ_LLM
 # OPTIMIZED BASED ON COMPREHENSIVE ANALYSIS: agent_log_20251202_103504.log
 # Target: STT <1200ms, LLM <500ms, TTS <800ms, Total <1500ms
 # Ultra-Low Latency Optimizations: Immediate Streaming (No Buffering)
-STT_ENDPOINTING_MS = 300  # 300ms: Prevents chopping sentences in half when user pauses briefly
-# Minimum word threshold: Prevent sending very short transcripts (1-2 words)
-STT_MIN_WORDS_THRESHOLD = 2  # 2 words: Minimum words before sending (ultra-low latency)
+# 🧠 ARCHITECTURE DECISION: The "Razor's Edge" - 220ms endpointing
+# The average human pause between words is ~200ms. 220ms is the "razor's edge" where we catch
+# the end of sentences instantly without cutting off slow talkers. 300ms was too safe (800ms+ latency floor).
+# 220ms reduces minimum latency from 800ms to ~720ms while still catching natural sentence endings.
+STT_ENDPOINTING_MS = 220  # 220ms: Aggressive endpointing for zero-latency - catches sentence end instantly
+# Minimum word threshold: Allow single-word responses (Yes, No, Stop, Wait, Namaste)
+# In translation apps, users often say single words - these should be translated
+STT_MIN_WORDS_THRESHOLD = 1  # 1 word: Allow single-word responses for better UX
 # Speech start time max age: Prevent incorrect latency calculations
 STT_SPEECH_START_MAX_AGE = 2.5  # 2.5 seconds: More accurate tracking
 # START_OF_SPEECH debouncing: Ignore multiple VAD events within this window
 STT_VAD_DEBOUNCE_SEC = 0.5  # 0.5 seconds: Faster detection for ultra-low latency
-# Performance monitoring
-PERF_METRICS_ENABLED = True  # Enable performance metrics collection
 LATENCY_ALERT_THRESHOLD_MS = 3000  # Alert if STT latency exceeds 3s
-TTS_BATCH_FIRST_WORDS = 4  # 4 words: Wait for 4 words (approx 1.5s) to ensure stability and prevent 429 errors
 TTS_BATCH_MIN_WORDS = 5  # 5 words: Sending 5-word chunks reduces API calls by 40% and prevents rate limits
 TTS_BATCH_SENTENCE_MIN_WORDS = 2  # 2 words: Complete phrases on sentence end
 TTS_BATCH_TIMEOUT_SEC = 0.5  # 500ms: Slightly longer for better sentence completion
@@ -450,8 +235,6 @@ CONTEXT_MAX_MESSAGES = 6  # System(1) + Last 5 messages only - CRITICAL for <500
 CONTEXT_MAX_ITEMS = 15  # System(1) + pairs(14) = 15 - Prevents "context amnesia" so LLM remembers previous topics
 # CRITICAL FIX: Reduced from 9 to 7 to completely eliminate context bleeding - smaller context = zero chance of including previous translations
 TRANSLATION_QUEUE_TIMEOUT = 0.03  # 30ms: Ultra-responsive pickup (reduced from 50ms - 40% faster)
-PROSODY_ANALYSIS_WINDOW = 0.5  # 500ms: Prosody analysis
-PROSODY_CACHE_TTL = 0.05  # 50ms: Cache refresh
 # Translation timeout: Adaptive based on text length (longer text = more time)
 def get_adaptive_translation_timeout(text_length: int) -> float:
     """Calculate adaptive timeout based on text length - Optimized for quality and completeness"""
@@ -462,13 +245,12 @@ def get_adaptive_translation_timeout(text_length: int) -> float:
     return min(base_timeout + char_timeout, 10.0)
 
 MAX_TRANSLATION_DELAY = 4.0  # 4s: Default timeout (adaptive function used for actual timeout)
-MAX_TRANSLATION_RETRIES = 2  # Retry failed translations up to 2 times
+# 🧹 CLEANUP "GHOST" RETRIES: Disable retries for real-time performance
+# Retries add 2-4 seconds of silence on failure - unacceptable for real-time translation
+# Fail fast, move on to next sentence. Speed > Recovery.
+MAX_TRANSLATION_RETRIES = 0  # Disable retries. Speed > Recovery.
 TRANSLATION_RETRY_DELAY_BASE = 0.2  # Base delay for exponential backoff (reduced from 0.3s - 33% faster)
 TRANSLATION_RETRY_BACKOFF_MULTIPLIER = 1.6  # Exponential backoff multiplier (reduced from 1.8 - faster recovery)
-# Production-Ready: Progressive Streaming Playback (Zero Gaps - Continuous Loop)
-MIN_PLAYABLE_SIZE = 3600   # 3600 bytes: ~75ms - Larger buffer for smooth continuous playback (prevents stop-start)
-MAX_BUFFER_SIZE = 12000    # 12000 bytes: ~250ms - Larger buffer for seamless continuous flow
-GAP_DETECTION_TIMEOUT = 0.5  # 500ms - Longer timeout to prevent premature flushing (ensures continuous loop feel)
 # Network resilience
 TCP_WARMING_TIMEOUT = 2.0  # 2s: Increased timeout for TCP warming
 TCP_WARMING_RETRIES = 3  # 3 retries with exponential backoff
@@ -538,7 +320,7 @@ DEEPGRAM_STT = deepgram.STT(
     model="nova-2",  # Nova-2: 200-300ms faster than nova-3 for real-time streaming (speed > nuanced grammar for zero latency)
     language="hi",  # Hindi language code
     smart_format=False,  # Disabled: Raw transcripts for better TTS input (no formatting interference) - Minimizes token latency
-    endpointing_ms=STT_ENDPOINTING_MS,  # 300ms pause detection - Prevents chopping sentences in half when user pauses briefly, also prevents "hanging" transcripts
+    endpointing_ms=STT_ENDPOINTING_MS,  # 220ms pause detection - Aggressive endpointing for zero-latency (razor's edge: catches sentence end instantly without cutting off slow talkers)
     interim_results=False,  # Disabled: Only use final transcripts to avoid duplicates and ensure stable TTS input
     no_delay=True,  # Disable delay for faster response
     # Note: vad_events=True is automatically enabled by the LiveKit Deepgram plugin
@@ -616,19 +398,11 @@ def get_elevenlabs_tts():
             # Update global voice ID
             ELEVENLABS_VOICE_ID = current_voice_id
             
-            # --- OPTIMIZED: Enhanced Pronunciation Quality ---
-            # VoiceSettings optimized for human-like pronunciation clarity
-            # stability=0.65: Higher consistency for pronunciation accuracy
-            # similarity_boost=0.85: Better voice matching and clarity
-            # style=0.4: Natural expressiveness without overdoing it
-            # use_speaker_boost=True: Enhances pronunciation clarity
-            # speed=0.9: Less laggy while maintaining natural pacing (10% slower)
+            # VoiceSettings with speed=0.85 (stability and similarity_boost are required)
             voice_settings = VoiceSettings(
-                stability=0.65,        # Increased from 0.5 - More consistent pronunciation
-                similarity_boost=0.85, # Increased from 0.75 - Better clarity & voice matching
-                style=0.4,            # Natural expressiveness (0.0-1.0, 0.4 = balanced)
-                use_speaker_boost=True, # Enhances pronunciation clarity
-                speed=0.8             # 0.8x speed - Slower, more natural pacing
+                stability=0.5,          # Required parameter (standard default)
+                similarity_boost=0.75, # Required parameter (standard default)
+                speed=0.85             # Desired speed setting
             )
             
             # Initialize TTS with voice_id and voice_settings directly
@@ -643,7 +417,7 @@ def get_elevenlabs_tts():
             _ELEVENLABS_TTS_VOICE_ID = current_voice_id  # Track the voice ID used
             
             if LOGGERS:
-                LOGGERS['tts'].info(f"ElevenLabs TTS initialized/recreated - Voice: {ELEVENLABS_VOICE_ID}, Model: {ELEVENLABS_MODEL_ID}, Speed: 0.85x (native), Streaming Latency: {ELEVENLABS_STREAMING_LATENCY}")
+                LOGGERS['tts'].info(f"ElevenLabs TTS initialized/recreated - Voice: {ELEVENLABS_VOICE_ID}, Model: {ELEVENLABS_MODEL_ID}, Speed: 0.85, Streaming Latency: {ELEVENLABS_STREAMING_LATENCY}")
         except Exception as e:
             if LOGGERS:
                 LOGGERS['error'].error(f"ElevenLabs TTS initialization failed: {str(e)}")
@@ -662,84 +436,34 @@ if ELEVENLABS_AVAILABLE:
 
 # ============================================================================
 # TRANSLATION ENGINE PROMPT
-# High-performance Hindi-to-English translator for live trading stream
-# Removed persona/roleplay to prevent hallucinations
+# Real-time Hindi-to-English livestream translation and text-normalization
+# Optimized for ElevenLabs Flash v2.5 text-to-speech
 # ============================================================================
 
 TRANSLATION_INSTRUCTIONS = (
-    "You are a high-performance HINDI-TO-ENGLISH TRANSLATOR for a live trading stream.\n"
-    "Your Goal: Convert spoken Hindi/Hinglish into professional, high-energy English text for TTS.\n\n"
+    "DEFINE:\n"
+    "You are a real-time Hindi-to-English livestream translation and text-normalization assistant. Your only job is to turn rough Hindi (and Hinglish) transcript chunks into smooth conversational English scripts optimized for ElevenLabs Flash v2.5 text-to-speech.\n\n"
+    "ACT:\n"
+    "For each input chunk, understand the intent and emotion, translate it into natural spoken English, and normalize it so TTS reads it clearly with good rhythm, emphasis, and pauses.\n\n"
     "RULES:\n"
-    "1. ACCURACY: Translate exactly what is said. Do NOT add names (like 'Jitu'), commands, or conversational filler unless the user explicitly said them.\n"
-    "2. NO HALLUCINATION: If the input is noise or incomplete, output nothing. Do not invent text.\n"
-    "3. KEEP TECHNICAL TERMS: Keep 'Nifty', 'BankNifty', 'Call', 'Put', 'Premium' as-is.\n"
-    "4. EMOTION: Use '!' for excitement and '...' for pauses. Use CAPS for urgent warnings.\n"
-    "5. FORMAT: Output ONLY the English translation text. Do NOT use JSON. Do NOT include 'Translation:' prefix."
+    "1. Preserve meaning, tone, and point of view; do not summarize, add, or invent content.\n"
+    "2. Use friendly, modern YouTube-style spoken English: short, clear sentences. Remove filler sounds (\"uh\", \"umm\", \"acha\", \"toh\", \"matlab\" etc.) unless they clearly add emotion; replace them with natural English fillers like \"well\", \"so…\", \"you know\".\n"
+    "3. Use punctuation to control speech: periods for full stops, commas for short pauses, ? for questions, ! for real excitement, ... for hesitation. Use ALL CAPS only for single key words that need strong emphasis; never use full sentences in all caps.\n"
+    "4. Normalize all numerals, dates, times, money, percentages, phone numbers, codes, URLs and handles into how they should be spoken (e.g. 2025 → \"twenty twenty-five\", ₹500 → \"five hundred rupees\", example.com → \"example dot com\", 9876543210 → \"nine eight seven, six five four, three two one zero\").\n"
+    "5. For acronyms or codes that should be read letter by letter, add spaces between letters (OTP → \"O T P\"). Approximate tricky names phonetically in normal English spelling so a TTS voice can say them correctly.\n"
+    "6. Treat each input as a partial livestream fragment. If a sentence is cut off, close it briefly and naturally without inventing new ideas.\n\n"
+    "EXECUTION:\n"
+    "Output only the final TTS-ready English script as plain text sentences and paragraphs: no Hindi, no explanations, no labels, no markdown, and no quotation marks or code fences."
 )
 
-TRANSLATION_PROMPT = TRANSLATION_INSTRUCTIONS + "\n\nTranslate the following:"
+TRANSLATION_PROMPT = TRANSLATION_INSTRUCTIONS + "\n\nTranslate:"
 
 
 def sanitize_text_for_tts(text: str) -> str | None:
-    """Sanitize text for TTS - removes punctuation that affects speech, preserves natural flow and ensures English-only"""
+    """Minimal text validation for TTS - Modern TTS engines handle messy text gracefully"""
     if not text or not text.strip():
         return None
-        
-    original_text = text.strip()
-    text = original_text
-        
-    # CRITICAL: Remove any Hindi/Devanagari characters that might leak through
-    # This ensures TTS only receives pure English text
-    # Remove Devanagari script characters (Hindi) - Unicode range U+0900 to U+097F
-    # Using pre-compiled regex for performance (saves ~5ms CPU per chunk)
-    hindi_chars = RE_HINDI.findall(text)
-    if hindi_chars:
-        LOGGERS['tts'].error(f"⚠️ HINDI DETECTED IN TTS INPUT - Removing: '{''.join(hindi_chars)}' from text: '{text[:100]}...'")
-    text = RE_HINDI.sub('', text)
-        
-    # Remove other non-ASCII characters except common punctuation and English letters
-    # Keep: A-Z, a-z, 0-9, space, and common punctuation
-    non_ascii_chars = RE_NON_ASCII.findall(text)
-    if non_ascii_chars:
-        LOGGERS['tts'].warning(f"⚠️ Non-ASCII characters detected - Removing: '{''.join(set(non_ascii_chars))}' from text")
-    text = RE_NON_ASCII.sub('', text)
-        
-    # Remove excessive punctuation but preserve natural pauses AND sentence boundaries
-    # CRITICAL: Keep periods (.) - TTS needs them for proper sentence intonation and pronunciation
-    # Only normalize excessive ellipsis (3+ dots) to single "..."
-    text = RE_ELLIPSIS_DOTS.sub('...', text)  # Normalize ellipsis to single "..."
-    # Keep single periods - they help TTS understand sentence boundaries for better pronunciation
-    text = RE_MULTI_COMMA.sub(',', text)  # Collapse multiple commas to single comma
-    text = RE_MULTI_EXCLAMATION.sub('!', text)  # Collapse multiple exclamations
-    text = RE_MULTI_QUESTION.sub('?', text)  # Collapse multiple questions
-        
-    # Validation: Ensure text has actual content (not just punctuation)
-    text_no_punct = text.replace('!', '').replace('?', '').replace('-', '').replace(':', '').replace(';', '').strip()
-    if not text_no_punct or len(text_no_punct) < 1:
-        LOGGERS['tts'].debug(f"TTS text contains no meaningful content after sanitization - skipping: '{original_text[:50]}...'")
-        return None
-        
-    # Quality check: Ensure meaningful words (not just single characters)
-    words = text_no_punct.split()
-    if len(words) == 0:
-        LOGGERS['tts'].debug(f"TTS text contains no words after sanitization - skipping: '{original_text[:50]}...'")
-        return None
-        
-    # Final validation: Ensure text contains English characters (A-Z, a-z) OR numbers (0-9)
-    # Numbers are valid TTS input - TTS can speak "49" as "forty-nine" or "four nine"
-    # Allow text with either letters or numbers (or both)
-    # Using pre-compiled regex for performance
-    has_letters = bool(RE_ENGLISH_LETTERS.search(text))
-    has_numbers = bool(RE_NUMBERS.search(text))
-        
-    if not has_letters and not has_numbers:
-        LOGGERS['tts'].debug(f"TTS text contains no English letters or numbers - skipping: '{original_text[:50]}...'")
-        return None
-        
-    # Preserve natural emphasis markers (exclamation, question marks for TTS intonation)
-    # These help TTS understand emotion and emphasis
-        
-    return text
+    return text.strip()
 
 
 def sanitize_llm_input(text: str) -> str:
@@ -762,9 +486,8 @@ def sanitize_llm_input(text: str) -> str:
 # Listens to Deepgram, throws text onto Conveyor Belt A (translation_queue)
 # NEVER STOPS - Continuous listening
 # ============================================================================
-async def listen_loop(room: rtc.Room, translation_queue: asyncio.Queue, 
-                    audio_amplitude_queue: asyncio.Queue) -> None:
-    """Team 1: Ears - Continuous listening with prosody tracking"""
+async def listen_loop(room: rtc.Room, translation_queue: asyncio.Queue) -> None:
+    """Team 1: Ears - Continuous listening"""
     audio_stream = None
     stt_stream = None
         
@@ -829,7 +552,7 @@ async def listen_loop(room: rtc.Room, translation_queue: asyncio.Queue,
             return
             
         async def feed_audio():
-            """Feed audio to STT and track prosody - runs until explicitly cancelled"""
+            """Feed audio to STT - runs until explicitly cancelled"""
             nonlocal audio_stream  # Must be declared before use
             while True:  # Keep running until cancelled, even if stream ends
                 try:
@@ -843,32 +566,6 @@ async def listen_loop(room: rtc.Room, translation_queue: asyncio.Queue,
                             if event and event.frame and stt_stream:
                                 try:
                                     stt_stream.push_frame(event.frame)
-                                        
-                                    # Prosody tracking: Calculate RMS for volume matching
-                                    try:
-                                        audio_data = np.frombuffer(event.frame.data, dtype=np.int16)
-                                        if len(audio_data) > 0:
-                                            rms = np.sqrt(np.mean(audio_data.astype(np.float32) ** 2))
-                                            normalized_rms = min(rms / 32768.0, 1.0)
-                                            db = 20.0 * np.log10(normalized_rms + 1e-10)
-                                                
-                                            try:
-                                                audio_amplitude_queue.put_nowait((time.time(), db))
-                                            except asyncio.QueueFull:
-                                                # FIFO drop: Remove oldest amplitude reading
-                                                try:
-                                                    audio_amplitude_queue.get_nowait()
-                                                    # Note: audio_amplitude_queue doesn't use task_done()
-                                                    # It's a simple data queue, not a work queue
-                                                    audio_amplitude_queue.put_nowait((time.time(), db))
-                                                except asyncio.QueueEmpty:
-                                                    # Queue became empty - try put again
-                                                    try:
-                                                        audio_amplitude_queue.put_nowait((time.time(), db))
-                                                    except asyncio.QueueFull:
-                                                        pass  # Drop this reading
-                                    except Exception:
-                                        pass  # Don't break audio feed on prosody errors
                                 except (asyncio.CancelledError, Exception):
                                     break
                     except StopAsyncIteration:
@@ -1098,7 +795,6 @@ async def listen_loop(room: rtc.Room, translation_queue: asyncio.Queue,
                                                     latency_msg += f" (processing: {deepgram_processing_time}ms)"
                                                 print(latency_msg)
                                                 LOGGERS['perf'].info(f"T1_STT latency: {stt_latency}ms" + (f" (Deepgram processing: {deepgram_processing_time}ms)" if deepgram_processing_time else ""))
-                                                perf_metrics.add_stt_latency(stt_latency)
                                         except asyncio.QueueFull:
                                             # FIFO drop
                                             try:
@@ -1230,83 +926,8 @@ async def listen_loop(room: rtc.Room, translation_queue: asyncio.Queue,
 # RUNS IN PARALLEL - Never blocks
 # ============================================================================
 
-# Prosody cache (performance optimization)
-# Thread-safe: All access is from async functions in same event loop (single-threaded)
-_prosody_cache = {"timestamp": 0, "speed": 1.0, "volume": 1.0}
-
-
-def get_prosody_from_amplitude(audio_amplitude_queue: asyncio.Queue) -> tuple[float, float]:
-    """Get prosody from recent audio (cached for performance)"""
-    current_time = time.time()
-        
-    # Check cache (reduces O(n) overhead)
-    if current_time - _prosody_cache["timestamp"] < PROSODY_CACHE_TTL:
-        return _prosody_cache["speed"], _prosody_cache["volume"]
-        
-    amplitudes = []
-    temp_items = []
-        
-    # Collect recent amplitudes (non-destructive read)
-    while True:
-        try:
-            timestamp, db = audio_amplitude_queue.get_nowait()
-            if current_time - timestamp <= PROSODY_ANALYSIS_WINDOW:
-                amplitudes.append(db)
-                temp_items.append((timestamp, db))
-        except asyncio.QueueEmpty:
-            break
-        
-    # Put items back (non-destructive)
-    for item in temp_items:
-        try:
-            audio_amplitude_queue.put_nowait(item)
-        except asyncio.QueueFull:
-            # FIFO drop: Remove oldest item to make room
-            try:
-                audio_amplitude_queue.get_nowait()
-                # Note: audio_amplitude_queue doesn't use task_done()
-                # It's a simple data queue, not a work queue
-                audio_amplitude_queue.put_nowait(item)
-            except asyncio.QueueEmpty:
-                # Queue became empty - try put again
-                try:
-                    audio_amplitude_queue.put_nowait(item)
-                except asyncio.QueueFull:
-                    pass  # Drop this item
-        
-    if not amplitudes:
-        _prosody_cache.update({"timestamp": current_time, "speed": 1.0, "volume": 1.0})
-        return 1.0, 1.0
-        
-    avg_db = np.mean(amplitudes)
-    max_db = np.max(amplitudes)
-        
-    # Map dB to speed (loud = faster)
-    if avg_db > -20:
-        speed = 1.15
-    elif avg_db > -30:
-        speed = 1.05
-    elif avg_db > -40:
-        speed = 1.0
-    else:
-        speed = 0.95
-        
-    # Map dB to volume (for emphasis)
-    if max_db > -15:
-        volume_boost = 1.2
-    elif max_db > -25:
-        volume_boost = 1.1
-    else:
-        volume_boost = 1.0
-        
-    _prosody_cache.update({"timestamp": current_time, "speed": speed, "volume": volume_boost})
-        
-    return speed, volume_boost
-
-
 async def process_single_translation(hindi_text: str, chat_ctx: llm.ChatContext,
                                     audio_queue: asyncio.Queue,
-                                    audio_amplitude_queue: asyncio.Queue,
                                     tts_semaphore: asyncio.Semaphore,
                                     shutdown_event: asyncio.Event,
                                     translation_lock: asyncio.Lock) -> str:
@@ -1329,11 +950,9 @@ async def process_single_translation(hindi_text: str, chat_ctx: llm.ChatContext,
         LOGGERS['llm'].warning(f"⚠️ Input too short ({input_length} chars) - skipping translation: '{hindi_text}'")
         return ""
     
-    # Reject inputs with only punctuation (no meaningful content)
-    # Using pre-compiled regex for performance
-    text_no_punct = RE_CLEAN_TEXT.sub('', hindi_text).strip()
-    if len(text_no_punct) == 0:
-        LOGGERS['llm'].warning(f"⚠️ Input contains only punctuation - skipping translation: '{hindi_text}'")
+    # Reject inputs with only whitespace
+    if not hindi_text.strip():
+        LOGGERS['llm'].warning(f"⚠️ Input contains only whitespace - skipping translation")
         return ""
     
     # Reject inputs that are too long (likely concatenated or corrupted)
@@ -1342,42 +961,6 @@ async def process_single_translation(hindi_text: str, chat_ctx: llm.ChatContext,
         hindi_text = hindi_text[:MAX_INPUT_LENGTH]  # Truncate to max length
         input_length = len(hindi_text)
     
-    # ENHANCED VALIDATION: Check for problematic patterns that might cause empty results
-    # Pattern 1: Check for excessive ellipsis or incomplete patterns
-    # CRITICAL FIX: Count total dots, not occurrences of '...'
-    total_dots = hindi_text.count('.')
-    total_ellipsis_chars = hindi_text.count('…')
-    # Reject if more than threshold dots total (indicates incomplete/truncated input)
-    if total_dots > MAX_DOTS_THRESHOLD or total_ellipsis_chars > MAX_ELLIPSIS_THRESHOLD:
-        LOGGERS['llm'].warning(f"⚠️ Input contains excessive ellipsis ({total_dots} dots, {total_ellipsis_chars} ellipsis) - may cause empty results: '{hindi_text[:50]}...'")
-        # For very short inputs with ellipsis, reject completely (likely incomplete)
-        if input_length < MIN_INPUT_LENGTH_VERY_SHORT and (total_dots > MAX_DOTS_SHORT_INPUT or total_ellipsis_chars > MAX_ELLIPSIS_SHORT_INPUT):
-            LOGGERS['llm'].warning(f"⚠️ Very short input with excessive ellipsis - rejecting to prevent empty result: '{hindi_text}'")
-            return ""
-        # Clean up excessive ellipsis for longer inputs (using pre-compiled regex)
-        hindi_text = RE_ELLIPSIS_DOTS.sub('...', hindi_text)
-        hindi_text = RE_ELLIPSIS_CHAR.sub('…', hindi_text)
-        input_length = len(hindi_text)
-    
-    # Pattern 1b: Check for inputs ending with ellipsis that are too short (likely incomplete)
-    if input_length < MIN_INPUT_LENGTH_SHORT and (hindi_text.endswith('...') or hindi_text.endswith('…') or hindi_text.endswith('....')):
-        LOGGERS['llm'].warning(f"⚠️ Very short input ending with ellipsis - likely incomplete, rejecting: '{hindi_text}'")
-        return ""
-    
-    # Pattern 2: Check for only whitespace after cleaning
-    if len(hindi_text.strip()) == 0:
-        LOGGERS['llm'].warning("⚠️ Input became empty after cleaning - skipping translation")
-        return ""
-    
-    # Pattern 3: Check for problematic Unicode characters that might confuse LLM
-    # Remove zero-width characters and other problematic Unicode (using pre-compiled regex)
-    if RE_PROBLEMATIC_UNICODE.search(hindi_text):
-        LOGGERS['llm'].debug("Cleaning problematic Unicode characters from input")
-        hindi_text = RE_PROBLEMATIC_UNICODE.sub('', hindi_text)
-        input_length = len(hindi_text)
-        if input_length == 0:
-            LOGGERS['llm'].warning("⚠️ Input became empty after Unicode cleaning - skipping translation")
-            return ""
     
     # ============================================================================
     # CRITICAL FIX #2: Proactive Context Pruning BEFORE Adding User Message
@@ -1446,6 +1029,7 @@ async def process_single_translation(hindi_text: str, chat_ctx: llm.ChatContext,
                         audio_frame_count = 0
                         total_audio_bytes = 0
                         try:
+                            LOGGERS['tts'].debug("Starting audio consumption loop - waiting for frames from ElevenLabs")
                             async for audio in tts_stream:
                                 if shutdown_event.is_set():
                                     LOGGERS['tts'].warning("TTS audio consumption stopped - shutdown event")
@@ -1473,24 +1057,38 @@ async def process_single_translation(hindi_text: str, chat_ctx: llm.ChatContext,
                                         except asyncio.QueueFull:
                                             LOGGERS['queue'].error("Audio queue still full after drop attempt - dropping new frame")
                                             pass  # Drop this frame
+                                else:
+                                    # Log when we receive audio events without frames (for debugging)
+                                    LOGGERS['tts'].debug(f"Received audio event without frame: {type(audio)}")
                             elapsed = int((time.time() - tts_start_time) * 1000) if tts_start_time else 0
-                            LOGGERS['tts'].info(f"TTS audio consumption completed - Frames: {audio_frame_count}, Total bytes: {total_audio_bytes}, Time: {elapsed}ms")
+                            if audio_frame_count == 0:
+                                LOGGERS['tts'].error(f"⚠️ CRITICAL: TTS audio consumption completed with 0 frames!")
+                                LOGGERS['tts'].error(f"⚠️ This means no audio was generated. Possible causes:")
+                                LOGGERS['tts'].error(f"⚠️ 1. Stream closed before ElevenLabs could send audio")
+                                LOGGERS['tts'].error(f"⚠️ 2. end_input() called too early or stream structure issue")
+                                LOGGERS['tts'].error(f"⚠️ 3. ElevenLabs API issue (check API key and voice ID)")
+                                LOGGERS['tts'].error(f"⚠️ Time: {elapsed}ms, Text chunks: {tts_text_chunks}, Total chars: {total_tts_chars}")
+                            else:
+                                LOGGERS['tts'].info(f"TTS audio consumption completed - Frames: {audio_frame_count}, Total bytes: {total_audio_bytes}, Time: {elapsed}ms")
                         except Exception as e:
                             elapsed = int((time.time() - tts_start_time) * 1000) if tts_start_time else 0
                             error_msg = str(e)
+                            LOGGERS['error'].error(f"TTS audio consumption exception after {elapsed}ms: {error_msg}")
                             # Check for specific connection errors
                             if "connection closed" in error_msg.lower() or "status_code=-1" in error_msg:
-                                LOGGERS['error'].error(f"TTS WebSocket connection closed after {elapsed}ms - This may indicate:")
+                                LOGGERS['error'].error(f"TTS WebSocket connection closed - This may indicate:")
                                 LOGGERS['error'].error(f"  1. Invalid voice ID (current: {ELEVENLABS_VOICE_ID})")
                                 LOGGERS['error'].error(f"  2. API key issues")
                                 LOGGERS['error'].error(f"  3. Network connectivity problems")
                                 LOGGERS['error'].error(f"  4. Rate limiting or quota exceeded")
-                            else:
-                                LOGGERS['error'].error(f"TTS audio consumption error after {elapsed}ms: {error_msg}")
                             pass
                     
-                    # Start audio consumption in background
+                    # Start audio consumption in background BEFORE pushing text
+                    # This ensures the consumption loop is ready to receive frames when ElevenLabs sends them
+                    # Create task and keep a reference to prevent garbage collection
                     audio_task = asyncio.create_task(consume_audio())
+                    # Give the task a moment to start iterating (ensures it's waiting for frames)
+                    await asyncio.sleep(0.01)  # 10ms - allow task to start
                     
                     try:
                         # CRITICAL FIX: Context pruning is handled in process_with_context_update()
@@ -1511,7 +1109,7 @@ async def process_single_translation(hindi_text: str, chat_ctx: llm.ChatContext,
                         # Calculate adaptive timeout based on text length
                         adaptive_timeout = get_adaptive_translation_timeout(len(hindi_text))
                         
-                        # Retry logic for translation timeouts with exponential backoff
+                        # Translation attempt (retries disabled for real-time performance - fail fast)
                         for retry_attempt in range(MAX_TRANSLATION_RETRIES + 1):
                             if retry_attempt > 0:
                                 # Exponential backoff: base_delay * (multiplier ^ (attempt - 1))
@@ -1558,77 +1156,51 @@ async def process_single_translation(hindi_text: str, chat_ctx: llm.ChatContext,
                                             llm_chunk_count += 1
                                             full_translation += text
                                                 
-                                            # CRITICAL: Check for Hindi in streaming output - detect early (using pre-compiled regex)
-                                            hindi_in_chunk = RE_HINDI.findall(text)
-                                            if hindi_in_chunk:
-                                                LOGGERS['llm'].error(f"🚨 CRITICAL: Hindi detected in LLM stream chunk: '{''.join(hindi_in_chunk)}' - Text: '{text[:100]}...'")
-                                                # Don't send Hindi to TTS - skip this chunk
-                                                continue
                                                 
-                                            # CRITICAL FIX: Buffer chunks to merge punctuation-only chunks with previous text
-                                            # This prevents punctuation from being filtered out during sanitization
-                                            # LLM now outputs raw text (no JSON) - directly accumulate chunks
+                                            # TTS BUFFERING STRATEGY: The "Sentence" Rule
+                                            # Buffer text until we hit a punctuation mark (. ? ! ,)
+                                            # This allows the TTS engine to understand the intonation of the sentence before speaking it
+                                            # Without this, if LLM sends "I...", TTS says "I" flatly, then "am..." comes - sounds robotic
+                                            
+                                            # Accumulate chunks into buffer
                                             tts_chunk_buffer += text
-                                                
-                                            # Check if current buffer contains meaningful content (not just punctuation)
-                                            # Remove punctuation to check if there's actual text (using pre-compiled regex)
-                                            text_without_punct = RE_CLEAN_TEXT.sub('', tts_chunk_buffer).strip()
-                                                
-                                            # Smart Buffering Strategy: Balance speed and quality
-                                            # Send when:
-                                            # 1. Buffer exceeds hard limit (prevent memory leaks)
-                                            # 2. Buffer exceeds soft limit (60 chars / ~250ms - full phrase for smooth intonation)
-                                            # 3. Smart early send: Buffer > 20 chars AND ends with punctuation (comma, period, etc.)
-                                            # 4. Has meaningful text (fallback for edge cases)
-                                            # CRITICAL FIX: Hard limit to prevent memory leaks
+                                            
+                                            # Safety check: Prevent memory leaks with hard limit
                                             if len(tts_chunk_buffer) > TTS_BUFFER_HARD_LIMIT:
-                                                # Force clear if buffer exceeds hard limit (prevent memory leak)
-                                                LOGGERS['tts'].warning(f"TTS buffer exceeded hard limit ({TTS_BUFFER_HARD_LIMIT} chars) - clearing: '{tts_chunk_buffer[:50]}...'")
+                                                LOGGERS['tts'].warning(f"TTS buffer exceeded hard limit ({TTS_BUFFER_HARD_LIMIT} chars) - forcing send: '{tts_chunk_buffer[:50]}...'")
+                                                # Force send even without punctuation to prevent memory issues
+                                                sanitized = sanitize_text_for_tts(tts_chunk_buffer)
+                                                if sanitized and len(sanitized) > 0:
+                                                    tts_text_chunks += 1
+                                                    total_tts_chars += len(sanitized)
+                                                    tts_stream.push_text(sanitized)
+                                                    LOGGERS['tts'].debug(f"TTS text pushed (hard limit) - Chunk #{tts_text_chunks}, Chars: {len(sanitized)}")
                                                 tts_chunk_buffer = ""
                                             else:
-                                                # Smart buffering logic: Check multiple conditions
-                                                # CRITICAL: Check punctuation BEFORE sanitization
-                                                # sanitize_text_for_tts() removes periods, so we must check buffer_ends_with_punct
-                                                # BEFORE calling sanitize_text_for_tts() to preserve the smart early-send trigger
+                                                # THE SENTENCE RULE: Check if buffer ends with punctuation
+                                                # Only send when we have a complete phrase (ends with . ? ! ,)
                                                 buffer_len = len(tts_chunk_buffer)
-                                                buffer_ends_with_punct = buffer_len > 0 and tts_chunk_buffer[-1] in ',.!?;:'
-                                                
-                                                # Condition 1: Full buffer reached (60 chars / ~250ms)
-                                                full_buffer_reached = buffer_len > TTS_BUFFER_SOFT_LIMIT
-                                                
-                                                # Condition 2: Smart early send (20+ chars with punctuation)
-                                                # Note: We check punctuation BEFORE sanitization, so this works correctly
-                                                # even though sanitize_text_for_tts() will remove periods later
-                                                smart_early_send = (buffer_len > TTS_BUFFER_SMART_MIN and buffer_ends_with_punct)
-                                                
-                                                # Condition 3: Has meaningful text (fallback)
-                                                has_meaningful_text = bool(text_without_punct)
-                                                
-                                                # Send if any condition is met
-                                                should_send = full_buffer_reached or smart_early_send or has_meaningful_text
-                                                
-                                                if should_send:
-                                                    # Sanitize the buffered chunk (includes punctuation merged with text)
-                                                    # Note: Periods will be removed here, but smart early-send was already triggered above
-                                                    sanitized = sanitize_text_for_tts(tts_chunk_buffer)
-                                                    if sanitized and len(sanitized) > 0:
-                                                        tts_text_chunks += 1
-                                                        total_tts_chars += len(sanitized)
-                                                        # Push buffered chunk to TTS (raw translation text)
-                                                        tts_stream.push_text(sanitized)
-                                                        if tts_text_chunks % TTS_CHUNK_LOG_INTERVAL == 0:  # Log every Nth chunk
-                                                            send_reason = "full_buffer" if full_buffer_reached else ("smart_early" if smart_early_send else "meaningful_text")
-                                                            LOGGERS['tts'].debug(f"TTS text pushed - Chunk #{tts_text_chunks}, Chars: {len(sanitized)}, Reason: {send_reason}, Total: {total_tts_chars}")
-                                                        # Clear buffer after successful push
-                                                        tts_chunk_buffer = ""
-                                                    else:
-                                                        # If sanitization failed but buffer has content, it might be punctuation-only
-                                                        # Keep it in buffer to merge with next chunk
-                                                        if buffer_len > TTS_BUFFER_SOFT_LIMIT:
-                                                            # Buffer too large - clear it to prevent memory issues
-                                                            LOGGERS['tts'].warning(f"TTS buffer too large and sanitization failed - clearing: '{tts_chunk_buffer[:50]}...'")
+                                                if buffer_len > 0:
+                                                    last_char = tts_chunk_buffer[-1]
+                                                    buffer_ends_with_punct = last_char in '.!?,'
+                                                    
+                                                    if buffer_ends_with_punct:
+                                                        # We have a complete phrase - send it to TTS
+                                                        # This ensures TTS gets the full sentence context for proper intonation
+                                                        sanitized = sanitize_text_for_tts(tts_chunk_buffer)
+                                                        if sanitized and len(sanitized) > 0:
+                                                            tts_text_chunks += 1
+                                                            total_tts_chars += len(sanitized)
+                                                            tts_stream.push_text(sanitized)
+                                                            if tts_text_chunks % TTS_CHUNK_LOG_INTERVAL == 0:  # Log every Nth chunk
+                                                                LOGGERS['tts'].debug(f"TTS text pushed (punctuation) - Chunk #{tts_text_chunks}, Chars: {len(sanitized)}, Total: {total_tts_chars}")
+                                                            # Clear buffer after successful push
                                                             tts_chunk_buffer = ""
-                                            # If buffer is just punctuation, keep buffering to merge with next chunk
+                                                        else:
+                                                            # Sanitization failed - clear buffer to prevent issues
+                                                            LOGGERS['tts'].warning(f"TTS buffer sanitization failed - clearing: '{tts_chunk_buffer[:50]}...'")
+                                                            tts_chunk_buffer = ""
+                                                    # If no punctuation yet, keep buffering (wait for complete phrase)
                                 
                                     # CRITICAL: Flush any remaining buffered chunks before ending
                                     if tts_chunk_buffer:
@@ -1674,16 +1246,15 @@ async def process_single_translation(hindi_text: str, chat_ctx: llm.ChatContext,
                                             continue  # Retry if empty result
                                         
                                         # ENHANCED: Post-validation - Check result quality before accepting
-                                        # Check if result is meaningful (not just punctuation or whitespace) (using pre-compiled regex)
-                                        result_no_punct = RE_CLEAN_TEXT.sub('', cleaned_result).strip()
-                                        if len(result_no_punct) == 0:
-                                            LOGGERS['llm'].warning(f"⚠️ Translation result contains only punctuation - likely invalid: '{cleaned_result[:50]}...'")
+                                        # Check if result is meaningful (not just whitespace)
+                                        if not cleaned_result.strip():
+                                            LOGGERS['llm'].warning(f"⚠️ Translation result is empty - likely invalid")
                                             if retry_attempt >= 1:
-                                                LOGGERS['llm'].warning(f"⚠️ Punctuation-only result after {retry_attempt + 1} attempts - skipping further retries")
+                                                LOGGERS['llm'].warning(f"⚠️ Empty result after {retry_attempt + 1} attempts - skipping further retries")
                                                 translation_success = False
                                                 break
                                             translation_timeout_occurred = True
-                                            continue  # Retry if punctuation-only
+                                            continue  # Retry if empty
                                         
                                         # Check if result is too short (likely incomplete)
                                         if len(cleaned_result) < MIN_OUTPUT_LENGTH:
@@ -1741,18 +1312,21 @@ async def process_single_translation(hindi_text: str, chat_ctx: llm.ChatContext,
                             LOGGERS['llm'].warning(f"LLM streaming failed after {MAX_TRANSLATION_RETRIES + 1} attempts - Chunks: {llm_chunk_count}, Translation length: {len(full_translation)} chars")
                         LOGGERS['tts'].info(f"TTS text push completed - Chunks: {tts_text_chunks}, Total chars: {total_tts_chars}")
                         
-                        # Mark end of input - stream will finish processing
+                        # 🚨 CRITICAL LATENCY FIX: Call end_input() IMMEDIATELY after sending all text
+                        # This signals ElevenLabs we're done sending text, so it can generate audio
                         try:
                             if tts_stream is not None:
                                 tts_stream.end_input()
-                                LOGGERS['tts'].debug("TTS stream end_input() called")
+                                LOGGERS['tts'].debug("TTS stream end_input() called - text sending complete")
                         except (AttributeError, Exception) as e:
                             LOGGERS['tts'].warning(f"Could not call end_input() on TTS stream: {str(e)}")
                     
                     except asyncio.TimeoutError:
+                        # Call end_input() even on timeout to prevent deadlock
                         try:
                             if tts_stream is not None:
                                 tts_stream.end_input()
+                                LOGGERS['tts'].debug("TTS stream end_input() called (timeout)")
                         except (NameError, AttributeError, UnboundLocalError, Exception):
                             pass  # Stream not initialized yet or already closed
                     except Exception as e:
@@ -1765,17 +1339,23 @@ async def process_single_translation(hindi_text: str, chat_ctx: llm.ChatContext,
                             LOGGERS['error'].error(f"  2. API key issues")
                             LOGGERS['error'].error(f"  3. Network connectivity problems")
                             LOGGERS['error'].error(f"  4. Rate limiting or quota exceeded")
+                        # Call end_input() even on error to prevent deadlock
                         try:
                             if tts_stream is not None:
                                 tts_stream.end_input()
+                                LOGGERS['tts'].debug("TTS stream end_input() called (error)")
                         except (NameError, AttributeError, UnboundLocalError, Exception):
                             pass  # Stream not initialized yet or already closed
                     
-                    # Wait for audio consumption to complete
-                    # EXACT CARTESIA PATTERN: Simple wait with reasonable timeout (matches Cartesia exactly)
+                    # 🚨 CRITICAL FIX: Wait for audio consumption BEFORE exiting async with block
+                    # We must wait for consume_audio() to finish receiving frames from ElevenLabs
+                    # Otherwise the stream closes and we get 0 frames (no audio)
+                    # This is different from waiting for playback - we're waiting for TTS to send frames to our queue
                     try:
+                        # Wait for audio consumption with reasonable timeout (10 seconds)
                         await asyncio.wait_for(audio_task, timeout=10.0)
                     except asyncio.TimeoutError:
+                        LOGGERS['tts'].warning("Audio consumption timeout - cancelling task")
                         audio_task.cancel()
                         try:
                             await audio_task
@@ -1788,7 +1368,6 @@ async def process_single_translation(hindi_text: str, chat_ctx: llm.ChatContext,
                         if tts_elapsed > 0:
                             print(f"T2_TTS: {tts_elapsed}ms")
                             LOGGERS['perf'].info(f"T2_TTS latency: {tts_elapsed}ms")
-                            perf_metrics.add_tts_latency(tts_elapsed)
             except Exception as e:
                 # CRITICAL FIX: Handle TTS stream creation failures
                 error_msg = str(e)
@@ -1809,24 +1388,11 @@ async def process_single_translation(hindi_text: str, chat_ctx: llm.ChatContext,
     if trans_elapsed > 0:
         print(f"T2_TRANS: {trans_elapsed}ms")
         LOGGERS['perf'].info(f"T2_TRANS total latency: {trans_elapsed}ms")
-        perf_metrics.add_total_latency(trans_elapsed)
         
     # Return cleaned translation with post-processing to remove incomplete markers
     # CRITICAL FIX: LLM now outputs raw text (no JSON) - use directly
     cleaned_translation = full_translation.strip()
         
-    # CRITICAL FIX: Detect and reject Hindi characters in translation output
-    # If LLM outputs Hindi instead of English, this is a critical error (using pre-compiled regex)
-    hindi_chars_in_output = RE_HINDI.findall(cleaned_translation)
-    if hindi_chars_in_output:
-        LOGGERS['llm'].error(f"🚨 CRITICAL ERROR: LLM OUTPUT CONTAINS HINDI CHARACTERS: '{''.join(hindi_chars_in_output)}'")
-        LOGGERS['llm'].error(f"🚨 Translation output: '{cleaned_translation[:200]}...'")
-        LOGGERS['llm'].error(f"🚨 This indicates the LLM failed to translate to English - removing Hindi characters")
-        # Remove Hindi characters as fallback
-        cleaned_translation = RE_HINDI.sub('', cleaned_translation).strip()
-        if len(cleaned_translation.strip()) < MIN_OUTPUT_LENGTH_MEANINGFUL:
-            LOGGERS['llm'].error(f"🚨 Translation became empty after removing Hindi - this is a critical translation failure")
-            return ""  # Return empty to trigger retry
         
     # ============================================================================
     # CRITICAL FIX #3: Keep ALL sentences - Never throw away user speech
@@ -1902,7 +1468,6 @@ async def process_single_translation(hindi_text: str, chat_ctx: llm.ChatContext,
 
 async def translate_and_synthesize_loop(translation_queue: asyncio.Queue, 
                                     audio_queue: asyncio.Queue, 
-                                    audio_amplitude_queue: asyncio.Queue, 
                                     shutdown_event: asyncio.Event) -> None:
     """Team 2: Brain - Sequential TTS with optimized pre-buffering for continuous flow"""
     chat_ctx = llm.ChatContext()
@@ -1942,7 +1507,7 @@ async def translate_and_synthesize_loop(translation_queue: asyncio.Queue,
                     current_task = asyncio.current_task()
                     try:
                         full_translation = await process_single_translation(
-                            text, chat_ctx, audio_queue, audio_amplitude_queue,
+                            text, chat_ctx, audio_queue,
                             tts_semaphore, shutdown_event, translation_lock
                         )
                             
@@ -2025,117 +1590,93 @@ async def translate_and_synthesize_loop(translation_queue: asyncio.Queue,
 
 async def playback_loop(source: rtc.AudioSource, audio_queue: asyncio.Queue, 
                     shutdown_event: asyncio.Event) -> None:
-    """Team 3: Mouth - Production-Ready Progressive Streaming Playback (Zero Gaps, Zero Latency)"""
-    # REMOVED: BASE_SPEED resampling - Direct playback for zero latency (saves 50-100ms CPU time per frame)
+    """Team 3: Mouth - Direct frame playback (LiveKit handles buffering)"""
+    LOGGERS['main'].info("Playback loop started - Direct frame playback")
         
-    LOGGERS['main'].info("Playback loop started - Continuous Loop Playback (No Stop-Start)")
-    LOGGERS['main'].info(f"MIN_PLAYABLE_SIZE: {MIN_PLAYABLE_SIZE} bytes (~75ms - Continuous loop playback)")
-        
-    # Production-Ready: Progressive Streaming Buffer
-    frame_buffer = bytearray()  # Accumulator buffer
     playback_count = 0
-    last_audio_time = time.time()
+    error_count = 0
         
     try:
         while not shutdown_event.is_set():
             try:
-                # Get frame with gap detection timeout
-                try:
-                    audio_frame = await asyncio.wait_for(audio_queue.get(), timeout=GAP_DETECTION_TIMEOUT)
-                    last_audio_time = time.time()  # Reset gap timer
-                except asyncio.TimeoutError:
-                    # GAP DETECTION: Only flush if buffer is substantial (prevents robotic stops from tiny flushes)
-                    # Small buffers (< 2000 bytes) are likely just pauses in TTS generation, not actual gaps
-                    # Increased threshold to prevent stop-start-stop behavior in continuous loop
-                    if len(frame_buffer) >= 2000:  # Only flush substantial buffers (prevents robotic stops in continuous loop)
-                        LOGGERS['perf'].debug(f"Gap detected - Flushing substantial buffer: {len(frame_buffer)} bytes")
-                        try:
-                            # Pass raw data directly (0ms latency cost - removed resampling)
-                            buffered_frame = rtc.AudioFrame(
-                                data=bytes(frame_buffer),
-                                sample_rate=24000,
-                                num_channels=1,
-                                samples_per_channel=len(frame_buffer) // 2
-                            )
-                            playback_start = time.time()
-                            await source.capture_frame(buffered_frame)
-                            playback_end = time.time()
-                            playback_elapsed = int((playback_end - playback_start) * 1000)
-                            playback_count += 1
-                            frame_buffer.clear()
-                            if playback_elapsed > 0:
-                                LOGGERS['perf'].debug(f"T3_PLAY (flushed): {playback_elapsed}ms, Buffer: 0 bytes")
-                        except Exception as e:
-                            LOGGERS['error'].error(f"Error flushing buffer: {str(e)}")
-                            frame_buffer.clear()
-                    # If buffer is small, don't flush - just continue waiting (prevents robotic stops)
-                    # This allows natural pauses in TTS generation without creating gaps
-                    continue
+                # Get frame from queue (no timeout - let LiveKit handle buffering)
+                audio_frame = await audio_queue.get()
                     
                 if audio_frame is None:
-                    # Shutdown - flush remaining buffer
-                    if len(frame_buffer) > 0:
-                        try:
-                            # Pass raw data directly (0ms latency cost - removed resampling)
-                            buffered_frame = rtc.AudioFrame(
-                                data=bytes(frame_buffer),
-                                sample_rate=24000,
-                                num_channels=1,
-                                samples_per_channel=len(frame_buffer) // 2
-                            )
-                            await source.capture_frame(buffered_frame)
-                            frame_buffer.clear()
-                        except Exception:
-                            pass
                     break
                     
-                # Add frame to buffer
-                if hasattr(audio_frame, 'data') and audio_frame.data:
-                    frame_buffer.extend(audio_frame.data)
-                else:
-                    # Fallback: try to get data another way
-                    try:
-                        frame_data = bytes(audio_frame)
-                        frame_buffer.extend(frame_data)
-                    except Exception:
-                        LOGGERS['error'].warning("Could not extract audio data from frame")
-                        continue
+                # ⚡ CPU LATENCY FIX: Pass frames directly - no validation/recreation per frame
+                # ElevenLabs outputs 24kHz mono frames that match source configuration
+                # Python object creation is slow - avoid recreating frames for every 10ms packet
+                # Only handle errors if they occur, don't pre-validate every frame
+                try:
+                    # Push frame directly to LiveKit (it has its own jitter buffer)
+                    playback_start = time.time()
+                    await source.capture_frame(audio_frame)
+                    playback_end = time.time()
+                    playback_elapsed = int((playback_end - playback_start) * 1000)
+                    playback_count += 1
+                    error_count = 0  # Reset error count on success
+                        
+                    if playback_count % PLAYBACK_LOG_INTERVAL == 0:  # Log every Nth playback
+                        LOGGERS['perf'].debug(f"T3_PLAY #{playback_count} - Latency: {playback_elapsed}ms")
+                except Exception as e:
+                    error_count += 1
+                    error_msg = str(e)
                     
-                audio_queue.task_done()
-                    
-                # PROGRESSIVE PLAYBACK: Play immediately when threshold reached (no sleep)
-                while len(frame_buffer) >= MIN_PLAYABLE_SIZE:
-                    # Limit chunk size for smooth playback
-                    chunk_size = min(len(frame_buffer), MAX_BUFFER_SIZE)
-                    chunk_data = bytes(frame_buffer[:chunk_size])
-                    frame_buffer = frame_buffer[chunk_size:]
-                    
-                    try:
-                        # Pass raw data directly (0ms latency cost - removed resampling)
-                        buffered_frame = rtc.AudioFrame(
-                            data=chunk_data,
-                            sample_rate=24000,
-                            num_channels=1,
-                            samples_per_channel=len(chunk_data) // 2
-                        )
+                    # Handle format mismatch errors by recreating frame with correct format
+                    if "sample_rate" in error_msg.lower() or "num_channels" in error_msg.lower() or "InvalidState" in error_msg:
+                        try:
+                            # Get frame data and recreate with correct format (24kHz, 1 channel)
+                            frame_data = None
+                            samples_per_channel = None
                             
-                        playback_start = time.time()
-                        await source.capture_frame(buffered_frame)
-                        playback_end = time.time()
-                        playback_elapsed = int((playback_end - playback_start) * 1000)
-                        playback_count += 1
+                            # Try to get frame data
+                            if hasattr(audio_frame, 'data') and audio_frame.data:
+                                frame_data = audio_frame.data
+                            elif hasattr(audio_frame, '__bytes__'):
+                                try:
+                                    frame_data = bytes(audio_frame)
+                                except Exception:
+                                    pass
                             
-                        # NO SLEEP - Continuous real-time playback
-                        # Audio frames arrive at real-time rate, no need for artificial delays
+                            # Try to get samples_per_channel from original frame (most accurate)
+                            if hasattr(audio_frame, 'samples_per_channel'):
+                                samples_per_channel = audio_frame.samples_per_channel
                             
-                        if playback_count % PLAYBACK_LOG_INTERVAL == 0:  # Log every Nth playback
-                            LOGGERS['perf'].debug(
-                                f"T3_PLAY #{playback_count} - Latency: {playback_elapsed}ms, "
-                                f"Chunk: {len(chunk_data)} bytes, Buffer: {len(frame_buffer)} bytes"
-                            )
-                    except Exception as e:
-                        LOGGERS['error'].error(f"Playback error: {str(e)}")
-                        break
+                            if frame_data:
+                                # Calculate samples_per_channel if not available from frame
+                                # For 16-bit PCM (2 bytes per sample), mono (1 channel)
+                                # samples_per_channel = total_bytes / (bytes_per_sample * num_channels)
+                                if samples_per_channel is None:
+                                    samples_per_channel = len(frame_data) // 2  # 16-bit = 2 bytes per sample
+                                
+                                # Recreate frame with source format (24kHz, 1 channel)
+                                corrected_frame = rtc.AudioFrame(
+                                    data=frame_data,
+                                    sample_rate=24000,
+                                    num_channels=1,
+                                    samples_per_channel=samples_per_channel
+                                )
+                                # Retry with corrected frame
+                                await source.capture_frame(corrected_frame)
+                                playback_count += 1
+                                error_count = 0  # Reset on successful retry
+                                if playback_count <= 10:  # Log first few fixes
+                                    LOGGERS['error'].debug(f"Fixed format mismatch - recreated frame (24kHz, 1ch, {samples_per_channel} samples)")
+                                # Success - frame played, continue to next iteration
+                                # (audio_queue.task_done() will be called below)
+                        except Exception as retry_error:
+                            # If retry also fails, log and continue
+                            if error_count <= 5:
+                                LOGGERS['error'].error(f"Playback error #{error_count} (retry failed): {str(retry_error)}")
+                    else:
+                        # Other errors - just log
+                        if error_count <= 5:  # Only log first few errors to avoid spam
+                            LOGGERS['error'].error(f"Playback error #{error_count}: {error_msg}")
+                    # Continue processing - don't break on individual frame errors
+                    # Mark task done even if there was an error (we tried our best)
+                    audio_queue.task_done()
                     
             except asyncio.CancelledError:
                 break
@@ -2144,21 +1685,6 @@ async def playback_loop(source: rtc.AudioSource, audio_queue: asyncio.Queue,
                 pass
     except asyncio.CancelledError:
         pass
-    finally:
-        # Final flush on shutdown
-        if len(frame_buffer) > 0:
-            try:
-                # Pass raw data directly (0ms latency cost - removed resampling)
-                buffered_frame = rtc.AudioFrame(
-                    data=bytes(frame_buffer),
-                    sample_rate=24000,
-                    num_channels=1,
-                    samples_per_channel=len(frame_buffer) // 2
-                )
-                await source.capture_frame(buffered_frame)
-                LOGGERS['main'].info(f"Final buffer flush: {len(frame_buffer)} bytes (zero latency)")
-            except Exception:
-                pass
 
 
 async def entrypoint(ctx: JobContext) -> None:
@@ -2277,10 +1803,11 @@ async def entrypoint(ctx: JobContext) -> None:
         
     # Create queues (bounded to prevent memory leaks)
     translation_queue = asyncio.Queue(maxsize=50)
-    audio_queue = asyncio.Queue(maxsize=50)
-    audio_amplitude_queue = asyncio.Queue(maxsize=100)
+    # Increase to 2500 (approx 50 seconds of audio) to prevent dropping frames 
+    # when ElevenLabs generates faster than real-time playback.
+    audio_queue = asyncio.Queue(maxsize=2500)
         
-    LOGGERS['queue'].info("Queues initialized - Translation: 50, Audio: 50, Amplitude: 100")
+    LOGGERS['queue'].info("Queues initialized - Translation: 50, Audio: 2500")
         
     shutdown_event = asyncio.Event()
     
@@ -2293,11 +1820,11 @@ async def entrypoint(ctx: JobContext) -> None:
         
     # Start all three teams
     LOGGERS['main'].info("Starting factory line teams...")
-    team1_ears = asyncio.create_task(listen_loop(room, translation_queue, audio_amplitude_queue))
+    team1_ears = asyncio.create_task(listen_loop(room, translation_queue))
     LOGGERS['main'].info("Team 1 (Ears) started - Deepgram STT listening")
         
     team2_brain = asyncio.create_task(translate_and_synthesize_loop(
-        translation_queue, audio_queue, audio_amplitude_queue, shutdown_event
+        translation_queue, audio_queue, shutdown_event
     ))
     LOGGERS['main'].info("Team 2 (Brain) started - LLM translation + TTS synthesis")
         
@@ -2305,21 +1832,6 @@ async def entrypoint(ctx: JobContext) -> None:
     LOGGERS['main'].info("Team 3 (Mouth) started - Audio playback")
     LOGGERS['main'].info("All teams started - Factory line operational")
         
-    # Start periodic performance summary logging (every 60 seconds)
-    async def periodic_performance_log():
-        """Periodically log performance metrics summary"""
-        while not shutdown_event.is_set():
-            try:
-                await asyncio.sleep(60)  # Log every 60 seconds
-                if not shutdown_event.is_set():
-                    perf_metrics.log_summary()
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                LOGGERS['perf'].debug(f"Performance logging error: {str(e)}")
-                await asyncio.sleep(60)
-        
-    perf_log_task = asyncio.create_task(periodic_performance_log())
         
     # Run until cancelled - Handle KeyboardInterrupt and _ExitCli gracefully
     try:
@@ -2357,12 +1869,6 @@ async def entrypoint(ctx: JobContext) -> None:
         shutdown_event.set()
         pass
     finally:
-        # Cancel performance logging task
-        perf_log_task.cancel()
-        try:
-            await perf_log_task
-        except Exception:
-            pass
         # Log final memory stats if monitoring is enabled
         if memory_monitor:
             summary = memory_monitor.get_summary()
@@ -2384,8 +1890,6 @@ async def entrypoint(ctx: JobContext) -> None:
             except asyncio.CancelledError:
                 pass
         
-        # Log final performance summary
-        perf_metrics.log_summary()
         # Graceful shutdown
         LOGGERS['main'].info("Shutting down factory line...")
         shutdown_event.set()
@@ -2425,29 +1929,7 @@ async def entrypoint(ctx: JobContext) -> None:
         LOGGERS['main'].info("=" * 80)
         LOGGERS['main'].info("AGENT SHUTDOWN COMPLETE")
         LOGGERS['main'].info(f"Log file: {LOGGERS['file']}")
-        if 'terminal_file' in LOGGERS:
-            LOGGERS['main'].info(f"Terminal output file: {LOGGERS['terminal_file']}")
         LOGGERS['main'].info("=" * 80)
-            
-        # Stop async logging listener (flush remaining logs to disk)
-        if 'listener' in LOGGERS and LOGGERS['listener']:
-            try:
-                LOGGERS['listener'].stop()  # Stop background thread and flush remaining logs
-            except Exception:
-                pass
-        
-        # Close terminal log file handle if it exists
-        if 'terminal_file_handle' in LOGGERS and LOGGERS['terminal_file_handle']:
-            try:
-                # Write footer to terminal log
-                LOGGERS['terminal_file_handle'].write(f"\n{'='*80}\n")
-                LOGGERS['terminal_file_handle'].write(f"TERMINAL OUTPUT CAPTURE - Ended: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-                LOGGERS['terminal_file_handle'].write(f"{'='*80}\n")
-                LOGGERS['terminal_file_handle'].flush()
-                LOGGERS['terminal_file_handle'].close()
-                print(f"\n✓ Terminal output saved to: {LOGGERS.get('terminal_file', 'N/A')}")
-            except Exception:
-                pass
             
         # Restore original stdout/stderr
         if hasattr(sys.stdout, 'console_stream'):
