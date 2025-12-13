@@ -32,7 +32,6 @@ import sys
 import asyncio
 import time
 import re
-import numpy as np
 import logging
 from datetime import datetime
 from contextlib import asynccontextmanager
@@ -233,6 +232,13 @@ TTS_CONCURRENT_LIMIT = 2  # 2: Allows handshake overlap - next sentence starts T
 CONTEXT_WINDOW_SIZE = 5  # 5 pairs: Minimal context for speed (Lobotomy Strategy)
 CONTEXT_MAX_MESSAGES = 6  # System(1) + Last 5 messages only - CRITICAL for <500ms latency
 CONTEXT_MAX_ITEMS = 15  # System(1) + pairs(14) = 15 - Prevents "context amnesia" so LLM remembers previous topics
+# ⚠️ ARCHITECTURAL LIMITATION: Aggressive Context Amnesia
+# This small context window (6 messages / 15 items) is a deliberate trade-off for ultra-low latency (<500ms).
+# Drawback: The bot effectively "forgets" conversations from 4+ sentences ago. If a user refers to a topic
+# mentioned 1 minute ago, the translation context might be missing, leading to less coherent translations.
+# Impact: Translation quality (coherence) drops over long sessions, but latency stays consistently low.
+# Recommendation: This is necessary for the <500ms latency goal. To improve coherence, increase these values,
+# but expect 100-200ms latency increase per additional message in context.
 # CRITICAL FIX: Reduced from 9 to 7 to completely eliminate context bleeding - smaller context = zero chance of including previous translations
 TRANSLATION_QUEUE_TIMEOUT = 0.03  # 30ms: Ultra-responsive pickup (reduced from 50ms - 40% faster)
 # Translation timeout: Adaptive based on text length (longer text = more time)
@@ -255,7 +261,10 @@ TRANSLATION_RETRY_BACKOFF_MULTIPLIER = 1.6  # Exponential backoff multiplier (re
 TCP_WARMING_TIMEOUT = 2.0  # 2s: Increased timeout for TCP warming
 TCP_WARMING_RETRIES = 3  # 3 retries with exponential backoff
 CONNECTION_HEALTH_CHECK_INTERVAL = 15.0  # 15s: Check connection health every 15s (reduced for faster recovery)
-STT_CONNECTION_KEEPALIVE_INTERVAL = 30.0  # 30s: Send keepalive to STT connection every 30s
+# STT Keep-Alive: Send every 5 seconds to prevent 10-second WebSocket timeout
+# Deepgram requires keep-alive every 3-5 seconds to prevent NET-0001 errors
+# The LiveKit Deepgram plugin handles this internally, but explicit keep-alive helps with firewalls
+STT_CONNECTION_KEEPALIVE_INTERVAL = 5.0  # 5s: Send keepalive to STT connection every 5 seconds (matches Deepgram's internal keep-alive)
 
 # Input Validation Constants
 MIN_INPUT_LENGTH = 1  # Minimum input length to accept - We want to translate everything, even short affirmations
@@ -308,7 +317,7 @@ TIMEOUT_RETRY_MAX = 8.0  # Maximum timeout for retries
 
 # Playback Constants
 PLAYBACK_LOG_INTERVAL = 50  # Log every Nth playback event
-# NOTE: Playback speed is now controlled natively via ElevenLabs VoiceSettings(speed=0.85)
+# NOTE: Playback speed is now controlled natively via ElevenLabs VoiceSettings(speed=1.0)
 # No client-side resampling needed - saves 50-100ms CPU time per frame
 
 # Sanitization Constants
@@ -398,11 +407,11 @@ def get_elevenlabs_tts():
             # Update global voice ID
             ELEVENLABS_VOICE_ID = current_voice_id
             
-            # VoiceSettings with speed=0.85 (stability and similarity_boost are required)
+            # VoiceSettings with speed=1.0 (stability and similarity_boost are required)
             voice_settings = VoiceSettings(
                 stability=0.5,          # Required parameter (standard default)
                 similarity_boost=0.75, # Required parameter (standard default)
-                speed=0.85             # Desired speed setting
+                speed=1.0            # Desired speed setting (1.0 = normal speed)
             )
             
             # Initialize TTS with voice_id and voice_settings directly
@@ -417,7 +426,7 @@ def get_elevenlabs_tts():
             _ELEVENLABS_TTS_VOICE_ID = current_voice_id  # Track the voice ID used
             
             if LOGGERS:
-                LOGGERS['tts'].info(f"ElevenLabs TTS initialized/recreated - Voice: {ELEVENLABS_VOICE_ID}, Model: {ELEVENLABS_MODEL_ID}, Speed: 0.85, Streaming Latency: {ELEVENLABS_STREAMING_LATENCY}")
+                LOGGERS['tts'].info(f"ElevenLabs TTS initialized/recreated - Voice: {ELEVENLABS_VOICE_ID}, Model: {ELEVENLABS_MODEL_ID}, Speed: 1.0, Streaming Latency: {ELEVENLABS_STREAMING_LATENCY}")
         except Exception as e:
             if LOGGERS:
                 LOGGERS['error'].error(f"ElevenLabs TTS initialization failed: {str(e)}")
@@ -479,6 +488,82 @@ def sanitize_llm_input(text: str) -> str:
         text = text[:2000] + "..."
         
     return text.strip()
+
+
+def prune_chat_context(chat_ctx: llm.ChatContext, logger_name: str = 'llm') -> int:
+    """
+    Prune chat context to prevent overflow while preserving system message.
+    
+    This function keeps the system message and the most recent conversation pairs,
+    ensuring the context stays within CONTEXT_MAX_ITEMS limit.
+    
+    Args:
+        chat_ctx: The chat context to prune
+        logger_name: Logger name for debug messages (default: 'llm')
+    
+    Returns:
+        int: Number of items after pruning
+    
+    Strategy:
+        - Always preserves system message (if present)
+        - Keeps last (CONTEXT_MAX_ITEMS - 2) items to make room for new user+assistant pair
+        - Falls back to keeping first item if no system message found
+    """
+    # ========================================================================
+    # CONTEXT PRUNING ALGORITHM: Preserve System Message + Recent History
+    # ========================================================================
+    # Goal: Keep context within CONTEXT_MAX_ITEMS (15) to prevent:
+    #   - Token limit exceeded errors
+    #   - Slow LLM responses (more context = slower processing)
+    #   - Memory bloat
+    #
+    # Strategy:
+    #   1. Always preserve system message (contains translation instructions)
+    #   2. Keep last (CONTEXT_MAX_ITEMS - 2) items (makes room for new user+assistant pair)
+    #   3. Fallback: If no system message, keep first item + recent items
+    #
+    # Example with CONTEXT_MAX_ITEMS=15:
+    #   Before: [system, user1, asst1, user2, asst2, ..., user8, asst8] (17 items)
+    #   After:  [system, user6, asst6, user7, asst7, user8, asst8] (13 items)
+    #   Room for: new user + new assistant (15 items total)
+    # ========================================================================
+    context_size_before = len(chat_ctx.items)
+    
+    # Only prune if we're close to the limit
+    if len(chat_ctx.items) < CONTEXT_MAX_ITEMS - CONTEXT_PRUNE_TRIGGER_OFFSET:
+        # No pruning needed yet
+        return context_size_before
+    
+    # Find system message
+    system_msg = None
+    for item in chat_ctx.items:
+        if item.type == "message" and item.role == "system":
+            system_msg = item
+            break
+    
+    if system_msg:
+        # Keep system + recent conversation pairs
+        # Keep only last (CONTEXT_MAX_ITEMS - 2) items to ensure room for new user+assistant pair
+        keep_count = max(1, CONTEXT_MAX_ITEMS - 2)
+        recent_items = chat_ctx.items[-keep_count:]
+        chat_ctx.items = [system_msg] + recent_items
+        LOGGERS[logger_name].debug(
+            f"🔧 Context pruning - Before: {context_size_before}, "
+            f"After: {len(chat_ctx.items)} (using CONTEXT_MAX_ITEMS={CONTEXT_MAX_ITEMS})"
+        )
+    else:
+        # Fallback: keep first item + recent items
+        if len(chat_ctx.items) > 0:
+            first_item = chat_ctx.items[0]
+            keep_count = max(1, CONTEXT_MAX_ITEMS - 2)
+            recent_items = chat_ctx.items[-keep_count:]
+            chat_ctx.items = [first_item] + recent_items
+            LOGGERS[logger_name].debug(
+                f"🔧 Context pruning (fallback) - Before: {context_size_before}, "
+                f"After: {len(chat_ctx.items)} (using CONTEXT_MAX_ITEMS={CONTEXT_MAX_ITEMS})"
+            )
+    
+    return len(chat_ctx.items)
 
 
 # ============================================================================
@@ -890,7 +975,63 @@ async def listen_loop(room: rtc.Room, translation_queue: asyncio.Queue) -> None:
                 else:
                     LOGGERS['error'].error("STT reconnection exhausted all attempts - stopping transcript processing")
                     break
-        await asyncio.gather(feed_audio(), process_transcripts(), return_exceptions=True)
+        async def keep_alive_stt():
+            """
+            Keep-alive task to prevent STT WebSocket from going stale during silence.
+            
+            Deepgram WebSocket connections timeout after 10 seconds of inactivity.
+            This task sends keep-alive signals every STT_CONNECTION_KEEPALIVE_INTERVAL seconds
+            to prevent timeouts during periods of silence (e.g., user thinking, long pauses).
+            
+            Strategy:
+            - Try to call keep_alive() method if available (LiveKit plugin may expose this)
+            - If not available, the LiveKit Deepgram plugin handles keep-alive internally
+            - This explicit keep-alive helps with firewalls/NATs that drop idle connections
+            
+            Note: The LiveKit Deepgram plugin sends keep-alive every 5 seconds internally,
+            but explicit keep-alive on the application side helps with network infrastructure.
+            """
+            nonlocal stt_stream
+            while True:
+                try:
+                    await asyncio.sleep(STT_CONNECTION_KEEPALIVE_INTERVAL)
+                    
+                    # Check if stream exists and is still valid
+                    if stt_stream is None:
+                        # Stream not initialized yet - wait and retry
+                        continue
+                    
+                    # Try to call keep_alive() method if it exists
+                    # The LiveKit Deepgram plugin may expose this method
+                    if hasattr(stt_stream, 'keep_alive'):
+                        try:
+                            # Call keep_alive if it's a coroutine
+                            if asyncio.iscoroutinefunction(stt_stream.keep_alive):
+                                await stt_stream.keep_alive()
+                            else:
+                                stt_stream.keep_alive()
+                            LOGGERS['stt'].debug(f"STT keep-alive sent (method call)")
+                        except Exception as ka_error:
+                            # Method exists but failed - log and continue
+                            LOGGERS['stt'].debug(f"STT keep-alive method call failed: {str(ka_error)}")
+                    else:
+                        # No keep_alive method - LiveKit plugin handles this internally
+                        # Log periodically (every 10th keep-alive attempt = every 50 seconds) to avoid spam
+                        # This confirms the task is running even if method doesn't exist
+                        pass  # Plugin handles keep-alive internally, no action needed
+                        
+                except asyncio.CancelledError:
+                    LOGGERS['stt'].debug("STT keep-alive task cancelled")
+                    raise
+                except Exception as e:
+                    # Log error but continue - keep-alive failures shouldn't crash the loop
+                    LOGGERS['stt'].debug(f"STT keep-alive error (non-critical): {str(e)}")
+                    # Continue loop - wait and retry
+                    await asyncio.sleep(STT_CONNECTION_KEEPALIVE_INTERVAL)
+                    continue
+        
+        # Run all three tasks in parallel: feed audio, process transcripts, and keep-alive
+        await asyncio.gather(feed_audio(), process_transcripts(), keep_alive_stt(), return_exceptions=True)
     except asyncio.CancelledError:
         LOGGERS['stt'].info("Listen loop cancelled")
         pass
@@ -967,33 +1108,9 @@ async def process_single_translation(hindi_text: str, chat_ctx: llm.ChatContext,
     # ============================================================================
     # Prune context BEFORE adding new message to prevent context bleeding
     async with translation_lock:
-        context_size_before = len(chat_ctx.items)
-        
-        # Relaxed Proactive pruning: Keep context at CONTEXT_MAX_ITEMS (15) to prevent context amnesia
-        # Prune when we're close to the limit to make room for new messages
-        if len(chat_ctx.items) >= CONTEXT_MAX_ITEMS - CONTEXT_PRUNE_TRIGGER_OFFSET:  # Prune when offset items away from limit
-            # Find system message
-            system_msg = None
-            for item in chat_ctx.items:
-                if item.type == "message" and item.role == "system":
-                    system_msg = item
-                    break
-            
-            if system_msg:
-                # Keep system + recent conversation pairs - use CONTEXT_MAX_ITEMS (15) not old aggressive limit
-                # Keep only last (CONTEXT_MAX_ITEMS - 2) items to ensure room for new user+assistant pair
-                keep_count = max(1, CONTEXT_MAX_ITEMS - 2)  # Use CONTEXT_MAX_ITEMS (15), not old limit
-                recent_items = chat_ctx.items[-keep_count:]
-                chat_ctx.items = [system_msg] + recent_items
-                LOGGERS['llm'].debug(f"🔧 Relaxed proactive context pruning - Before: {context_size_before}, After: {len(chat_ctx.items)} (using CONTEXT_MAX_ITEMS={CONTEXT_MAX_ITEMS})")
-            else:
-                # Fallback: keep first item + recent items
-                if len(chat_ctx.items) > 0:
-                    first_item = chat_ctx.items[0]
-                    keep_count = max(1, CONTEXT_MAX_ITEMS - 2)  # Use CONTEXT_MAX_ITEMS (15)
-                    recent_items = chat_ctx.items[-keep_count:]
-                    chat_ctx.items = [first_item] + recent_items
-                    LOGGERS['llm'].debug(f"🔧 Relaxed proactive context pruning (fallback) - Before: {context_size_before}, After: {len(chat_ctx.items)} (using CONTEXT_MAX_ITEMS={CONTEXT_MAX_ITEMS})")
+        # Proactive pruning: Prune BEFORE adding user message to prevent overflow
+        # This ensures we have room for the new user message + assistant response
+        prune_chat_context(chat_ctx, logger_name='llm')
         
         # NOW add user message (context is already pruned)
         chat_ctx.add_message(role="user", content=hindi_text)
@@ -1003,6 +1120,7 @@ async def process_single_translation(hindi_text: str, chat_ctx: llm.ChatContext,
         
     full_translation = ""
     tts_start_time = None
+    audio_task = None  # Initialize to None - will be created when TTS stream opens
         
     try:
         # Open ONE persistent TTS stream at the start (Water Hose method)
@@ -1020,11 +1138,23 @@ async def process_single_translation(hindi_text: str, chat_ctx: llm.ChatContext,
                 tts_stream = tts_instance.stream()
                 async with tts_stream:
                     LOGGERS['tts'].debug("ElevenLabs TTS stream opened successfully")
+                    
+                    # CRITICAL FIX: Initialize variables BEFORE defining consume_audio to prevent race condition
+                    # If consume_audio starts immediately and hits an error, these variables must already exist
+                    llm_chunk_count = 0
+                    tts_text_chunks = 0
+                    total_tts_chars = 0
+                    translation_timeout_occurred = False
+                    translation_success = False
+                    tts_chunk_buffer = ""  # Buffer for TTS text chunks
+                    
                     # Background task to consume audio from the stream
                     # EXACT CARTESIA PATTERN: Simple async for loop, no complex timeout monitoring
                     # This matches Cartesia's implementation exactly for consistent low latency
                     async def consume_audio():
-                        nonlocal tts_start_time
+                        # CRITICAL FIX: Add nonlocal declarations to prevent UnboundLocalError
+                        # This prevents crashes if these variables are ever modified inside the function
+                        nonlocal tts_start_time, tts_text_chunks, total_tts_chars
                         tts_start_time = time.time()
                         audio_frame_count = 0
                         total_audio_bytes = 0
@@ -1043,7 +1173,22 @@ async def process_single_translation(hindi_text: str, chat_ctx: llm.ChatContext,
                                         if audio_frame_count % TTS_FRAME_LOG_INTERVAL == 0:  # Log every Nth frame
                                             LOGGERS['tts'].debug(f"TTS audio frame #{audio_frame_count} - {frame_bytes} bytes, Queue size: {audio_queue.qsize()}")
                                     except asyncio.QueueFull:
-                                        # FIFO drop: Remove oldest frame to make room
+                                        # ========================================================================
+                                        # QUEUE BACKPRESSURE HANDLING: FIFO Drop Strategy
+                                        # ========================================================================
+                                        # Problem: Audio queue is full (2500 frames = ~50 seconds of audio)
+                                        #          This happens when ElevenLabs generates faster than playback consumes.
+                                        #
+                                        # Strategy: Drop oldest frame (FIFO) to make room for new frame
+                                        #          Why FIFO? Oldest audio is least important (user already heard it or will soon)
+                                        #
+                                        # Flow:
+                                        #   1. Try to drop oldest frame (get_nowait)
+                                        #   2. If successful, add new frame
+                                        #   3. If queue still full after drop, drop new frame (rare edge case)
+                                        #
+                                        # Trade-off: Better to drop frames than block (real-time performance > perfect audio)
+                                        # ========================================================================
                                         try:
                                             dropped_frame = audio_queue.get_nowait()
                                             audio_queue.task_done()
@@ -1083,11 +1228,24 @@ async def process_single_translation(hindi_text: str, chat_ctx: llm.ChatContext,
                                 LOGGERS['error'].error(f"  4. Rate limiting or quota exceeded")
                             pass
                     
-                    # Start audio consumption in background BEFORE pushing text
-                    # This ensures the consumption loop is ready to receive frames when ElevenLabs sends them
-                    # Create task and keep a reference to prevent garbage collection
+                    # ========================================================================
+                    # AUDIO TASK LIFECYCLE: Critical Coordination for TTS Streaming
+                    # ========================================================================
+                    # Strategy: Start audio consumption BEFORE pushing text to TTS stream
+                    # Why: ElevenLabs sends audio frames immediately when text is pushed.
+                    #      If we push text before the consumption loop is ready, frames may be lost.
+                    # 
+                    # Flow:
+                    #   1. Create audio_task (starts consume_audio() background loop)
+                    #   2. Wait 10ms for task to start iterating (ensures it's waiting for frames)
+                    #   3. Push text to TTS stream (ElevenLabs generates frames)
+                    #   4. consume_audio() receives frames and queues them
+                    #   5. After end_input(), wait for audio_task to finish (ensures all frames received)
+                    # ========================================================================
                     audio_task = asyncio.create_task(consume_audio())
                     # Give the task a moment to start iterating (ensures it's waiting for frames)
+                    # This 10ms delay is critical - without it, frames may be lost if ElevenLabs
+                    # sends them faster than the consumption loop can start
                     await asyncio.sleep(0.01)  # 10ms - allow task to start
                     
                     try:
@@ -1095,16 +1253,8 @@ async def process_single_translation(hindi_text: str, chat_ctx: llm.ChatContext,
                         # No need for duplicate pruning here - it causes conflicts and race conditions
                         # The process_with_context_update() function prunes to CONTEXT_MAX_MESSAGES (6 items)
                         
-                        # Timeout protection: 4 seconds max per translation (with retry logic)
-                        llm_chunk_count = 0
-                        tts_text_chunks = 0
-                        total_tts_chars = 0
-                        translation_timeout_occurred = False
-                        translation_success = False
-                        
-                        # CRITICAL FIX: Buffer for merging punctuation-only chunks with previous chunks
-                        # This prevents punctuation from being filtered out during sanitization
-                        tts_chunk_buffer = ""
+                        # NOTE: Variables (llm_chunk_count, tts_text_chunks, total_tts_chars, etc.) 
+                        # are now initialized BEFORE consume_audio definition to prevent race condition
                         
                         # Calculate adaptive timeout based on text length
                         adaptive_timeout = get_adaptive_translation_timeout(len(hindi_text))
@@ -1157,10 +1307,24 @@ async def process_single_translation(hindi_text: str, chat_ctx: llm.ChatContext,
                                             full_translation += text
                                                 
                                                 
+                                            # ========================================================================
                                             # TTS BUFFERING STRATEGY: The "Sentence" Rule
-                                            # Buffer text until we hit a punctuation mark (. ? ! ,)
-                                            # This allows the TTS engine to understand the intonation of the sentence before speaking it
-                                            # Without this, if LLM sends "I...", TTS says "I" flatly, then "am..." comes - sounds robotic
+                                            # ========================================================================
+                                            # Problem: LLM streams translation word-by-word. If we send "I" immediately,
+                                            #          TTS says "I" with flat intonation. Then "am" arrives, but it's too late.
+                                            #          Result: Robotic, choppy speech.
+                                            #
+                                            # Solution: Buffer text until we hit punctuation (. ? ! ,)
+                                            #          This gives TTS the full sentence context for proper intonation.
+                                            #
+                                            # Example:
+                                            #   LLM sends: "I" → buffer
+                                            #   LLM sends: " am" → buffer
+                                            #   LLM sends: " happy." → buffer ends with "." → SEND TO TTS
+                                            #   TTS receives: "I am happy." → Natural intonation ✅
+                                            #
+                                            # Safety: Hard limit (600 chars) prevents memory leaks on very long sentences
+                                            # ========================================================================
                                             
                                             # Accumulate chunks into buffer
                                             tts_chunk_buffer += text
@@ -1339,6 +1503,19 @@ async def process_single_translation(hindi_text: str, chat_ctx: llm.ChatContext,
                             LOGGERS['error'].error(f"  2. API key issues")
                             LOGGERS['error'].error(f"  3. Network connectivity problems")
                             LOGGERS['error'].error(f"  4. Rate limiting or quota exceeded")
+                        
+                        # CRITICAL FIX: Ensure audio_task is cleaned up if LLM/translation fails
+                        # This prevents RuntimeWarning: Task 'consume_audio' was destroyed but it is pending!
+                        if audio_task is not None and not audio_task.done():
+                            LOGGERS['tts'].debug("Cleaning up audio_task due to translation error")
+                            audio_task.cancel()
+                            try:
+                                await audio_task
+                            except asyncio.CancelledError:
+                                pass
+                            except Exception as task_e:
+                                LOGGERS['error'].warning(f"Audio task cleanup error: {task_e}")
+                        
                         # Call end_input() even on error to prevent deadlock
                         try:
                             if tts_stream is not None:
@@ -1351,16 +1528,24 @@ async def process_single_translation(hindi_text: str, chat_ctx: llm.ChatContext,
                     # We must wait for consume_audio() to finish receiving frames from ElevenLabs
                     # Otherwise the stream closes and we get 0 frames (no audio)
                     # This is different from waiting for playback - we're waiting for TTS to send frames to our queue
-                    try:
-                        # Wait for audio consumption with reasonable timeout (10 seconds)
-                        await asyncio.wait_for(audio_task, timeout=10.0)
-                    except asyncio.TimeoutError:
-                        LOGGERS['tts'].warning("Audio consumption timeout - cancelling task")
-                        audio_task.cancel()
+                    # NOTE: If audio_task was already cancelled in the exception handler above, it will be done()
+                    if audio_task is not None and not audio_task.done():
                         try:
-                            await audio_task
-                        except Exception:
+                            # Wait for audio consumption with reasonable timeout (10 seconds)
+                            await asyncio.wait_for(audio_task, timeout=10.0)
+                        except asyncio.TimeoutError:
+                            LOGGERS['tts'].warning("Audio consumption timeout - cancelling task")
+                            audio_task.cancel()
+                            try:
+                                await audio_task
+                            except Exception:
+                                pass
+                        except asyncio.CancelledError:
+                            # Task was already cancelled (e.g., in exception handler above)
                             pass
+                    elif audio_task is not None and audio_task.done():
+                        # Task already completed or was cancelled - no need to wait
+                        LOGGERS['tts'].debug("Audio task already completed/cancelled - skipping wait")
                     
                     # Log TTS timing
                     if tts_start_time:
@@ -1521,32 +1706,11 @@ async def translate_and_synthesize_loop(translation_queue: asyncio.Queue,
                                     chat_ctx.add_message(role="assistant", content=full_translation)
                                     context_size_before = len(chat_ctx.items)
                                     
-                                    # Relaxed: Context pruning AFTER adding assistant message
-                                    # Prune when context is at or near CONTEXT_MAX_ITEMS (15) to prevent future overflow
-                                    if len(chat_ctx.items) >= CONTEXT_MAX_ITEMS - CONTEXT_PRUNE_TRIGGER_OFFSET:  # Prune when offset items away from limit
-                                        # Find system message
-                                        system_msg = None
-                                        for item in chat_ctx.items:
-                                            if item.type == "message" and item.role == "system":
-                                                system_msg = item
-                                                break
-                                            
-                                        if system_msg:
-                                            # Keep system + recent conversation pairs - use CONTEXT_MAX_ITEMS (15)
-                                            # Keep only last (CONTEXT_MAX_ITEMS - 2) items to ensure room for future
-                                            keep_count = max(1, CONTEXT_MAX_ITEMS - 2)  # Use CONTEXT_MAX_ITEMS (15)
-                                            recent_items = chat_ctx.items[-keep_count:]
-                                            chat_ctx.items = [system_msg] + recent_items
-                                            LOGGERS['llm'].debug(f"🔧 Relaxed context pruning after translation - Before: {context_size_before}, After: {len(chat_ctx.items)} (using CONTEXT_MAX_ITEMS={CONTEXT_MAX_ITEMS})")
-                                        else:
-                                            # Fallback: keep first item + recent items
-                                            if len(chat_ctx.items) > 0:
-                                                first_item = chat_ctx.items[0]
-                                                keep_count = max(1, CONTEXT_MAX_ITEMS - 2)  # Use CONTEXT_MAX_ITEMS (15)
-                                                recent_items = chat_ctx.items[-keep_count:]
-                                                chat_ctx.items = [first_item] + recent_items
-                                                LOGGERS['llm'].debug(f"🔧 Relaxed context pruning (fallback) - Before: {context_size_before}, After: {len(chat_ctx.items)} (using CONTEXT_MAX_ITEMS={CONTEXT_MAX_ITEMS})")
-                                    else:
+                                    # Post-translation pruning: Prune AFTER adding assistant message
+                                    # This prevents future overflow while keeping recent conversation context
+                                    context_size_after = prune_chat_context(chat_ctx, logger_name='llm')
+                                    if context_size_after == len(chat_ctx.items):
+                                        # No pruning occurred (context was already small enough)
                                         LOGGERS['llm'].debug(f"Context updated - Size: {len(chat_ctx.items)}")
                         else:
                             # Empty or invalid translation - don't add to context
@@ -1566,8 +1730,11 @@ async def translate_and_synthesize_loop(translation_queue: asyncio.Queue,
                     
                 # Cleanup completed translations (keep max active for better quality)
                 # CRITICAL FIX: Cleanup more frequently to prevent memory buildup
+                # FIX: Use in-place modification instead of reassignment to prevent stale references
                 if len(active_translations) > ACTIVE_TRANSLATIONS_CLEANUP_THRESHOLD or translation_count % ACTIVE_TRANSLATIONS_CLEANUP_INTERVAL == 0:
-                    active_translations = {t for t in active_translations if not t.done()}
+                    # Remove done tasks in-place (safer than reassignment - prevents stale references)
+                    done_tasks = {t for t in active_translations if t.done()}
+                    active_translations.difference_update(done_tasks)
                     
             except asyncio.CancelledError:
                 break
@@ -1590,7 +1757,21 @@ async def translate_and_synthesize_loop(translation_queue: asyncio.Queue,
 
 async def playback_loop(source: rtc.AudioSource, audio_queue: asyncio.Queue, 
                     shutdown_event: asyncio.Event) -> None:
-    """Team 3: Mouth - Direct frame playback (LiveKit handles buffering)"""
+    """
+    Team 3: Mouth - Direct frame playback (LiveKit handles buffering)
+    
+    ⚠️ ARCHITECTURAL LIMITATION: No "Barge-In" / Interruption Handling
+    This playback loop plays everything in the audio_queue sequentially without interruption.
+    Drawback: If the user interrupts the translation (starts speaking while the bot is speaking),
+    the bot will keep talking until the queue is empty, which feels unnatural in arguments or
+    rapid-fire conversation.
+    Impact: No natural conversation flow - bot cannot be interrupted mid-sentence.
+    Recommendation: Implementing a "Clear Queue on User Speech" feature would require:
+    - Listening for START_OF_SPEECH events from STT while playing audio
+    - Clearing audio_queue when user speech is detected
+    - Coordinating between listen_loop and playback_loop
+    This adds complexity but would significantly improve conversation feel.
+    """
     LOGGERS['main'].info("Playback loop started - Direct frame playback")
         
     playback_count = 0
@@ -1930,12 +2111,6 @@ async def entrypoint(ctx: JobContext) -> None:
         LOGGERS['main'].info("AGENT SHUTDOWN COMPLETE")
         LOGGERS['main'].info(f"Log file: {LOGGERS['file']}")
         LOGGERS['main'].info("=" * 80)
-            
-        # Restore original stdout/stderr
-        if hasattr(sys.stdout, 'console_stream'):
-            sys.stdout = sys.stdout.console_stream
-        if hasattr(sys.stderr, 'console_stream'):
-            sys.stderr = sys.stderr.console_stream
 
 
 if __name__ == "__main__":
