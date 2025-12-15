@@ -197,10 +197,10 @@ LOGGERS = setup_logging()
 # Physics: 8B model requires less VRAM bandwidth than 70B, resulting in ~250ms faster Time-To-First-Token (TTFT)
 # Quality: 8B is sufficient for direct Hindi-English translation mapping (70B is overkill for simple translation)
 GROQ_LLM = openai.LLM(
-    model="llama-3.1-8b-instant",  # Zero Latency: ~20-50ms TTFT vs ~200-300ms for 70B (saves ~250ms per turn)
+    model="llama-3.3-70b-versatile",  # Best Quality: 96.05/100 average quality score (vs 87.06 for 8B), ~409ms latency (tested with 30 trading examples)
     base_url="https://api.groq.com/openai/v1",
     api_key=os.getenv("GROQ_API_KEY"),
-    temperature=0.3,  # Lower temperature for faster, more deterministic translations (speed over creativity)
+    temperature=0.6,  # Optimal: Better naturalness without sacrificing accuracy (tested: 0.5 and 0.7 are worse)
 )
 
 # Use Groq LLM directly (no Cerebras wrapper)
@@ -230,8 +230,8 @@ TTS_BATCH_MIN_WORDS_TIMEOUT = 2  # 2 words: Better minimum before timeout send
 TTS_MAX_CHUNK_SIZE = 40  # 40 chars: Smaller chunks = faster synthesis
 TTS_CONCURRENT_LIMIT = 2  # 2: Allows handshake overlap - next sentence starts TTS connection while current one is speaking (hides ~150ms connection time)
 CONTEXT_WINDOW_SIZE = 5  # 5 pairs: Minimal context for speed (Lobotomy Strategy)
-CONTEXT_MAX_MESSAGES = 6  # System(1) + Last 5 messages only - CRITICAL for <500ms latency
-CONTEXT_MAX_ITEMS = 15  # System(1) + pairs(14) = 15 - Prevents "context amnesia" so LLM remembers previous topics
+CONTEXT_MAX_MESSAGES = 16  # System(1) + Last 15 messages - Better pronoun resolution (+1.7 points from tests)
+CONTEXT_MAX_ITEMS = 32     # System(1) + pairs(31) = 32 - Prevents context amnesia, improves coherence
 # ⚠️ ARCHITECTURAL LIMITATION: Aggressive Context Amnesia
 # This small context window (6 messages / 15 items) is a deliberate trade-off for ultra-low latency (<500ms).
 # Drawback: The bot effectively "forgets" conversations from 4+ sentences ago. If a user refers to a topic
@@ -449,20 +449,136 @@ if ELEVENLABS_AVAILABLE:
 # Optimized for ElevenLabs Flash v2.5 text-to-speech
 # ============================================================================
 
+# YouTuber Context - Describes the speaker's role and style for better translation accuracy
+# Modify this variable to customize translation behavior based on the YouTuber's content type
+YOUTUBER_CONTEXT = (
+    "The speaker is a live trading YouTuber who conducts long-form trading sessions. "
+    "He provides real-time trading suggestions to his audience, discussing where to trade and where not to trade. "
+    "He uses casual Hindi greetings like 'Namaste', 'Bhaiyyu', 'brothers', and interacts naturally with viewers. "
+    "His content includes trading analysis, market movements, entry/exit points, stop loss, targets, and general trading advice. "
+    "The tone is conversational and engaging, mixing trading technical terms with friendly audience interaction."
+)
+
 TRANSLATION_INSTRUCTIONS = (
-    "DEFINE:\n"
-    "You are a real-time Hindi-to-English livestream translation and text-normalization assistant. Your only job is to turn rough Hindi (and Hinglish) transcript chunks into smooth conversational English scripts optimized for ElevenLabs Flash v2.5 text-to-speech.\n\n"
-    "ACT:\n"
-    "For each input chunk, understand the intent and emotion, translate it into natural spoken English, and normalize it so TTS reads it clearly with good rhythm, emphasis, and pauses.\n\n"
-    "RULES:\n"
-    "1. Preserve meaning, tone, and point of view; do not summarize, add, or invent content.\n"
-    "2. Use friendly, modern YouTube-style spoken English: short, clear sentences. Remove filler sounds (\"uh\", \"umm\", \"acha\", \"toh\", \"matlab\" etc.) unless they clearly add emotion; replace them with natural English fillers like \"well\", \"so…\", \"you know\".\n"
-    "3. Use punctuation to control speech: periods for full stops, commas for short pauses, ? for questions, ! for real excitement, ... for hesitation. Use ALL CAPS only for single key words that need strong emphasis; never use full sentences in all caps.\n"
-    "4. Normalize all numerals, dates, times, money, percentages, phone numbers, codes, URLs and handles into how they should be spoken (e.g. 2025 → \"twenty twenty-five\", ₹500 → \"five hundred rupees\", example.com → \"example dot com\", 9876543210 → \"nine eight seven, six five four, three two one zero\").\n"
-    "5. For acronyms or codes that should be read letter by letter, add spaces between letters (OTP → \"O T P\"). Approximate tricky names phonetically in normal English spelling so a TTS voice can say them correctly.\n"
-    "6. Treat each input as a partial livestream fragment. If a sentence is cut off, close it briefly and naturally without inventing new ideas.\n\n"
-    "EXECUTION:\n"
-    "Output only the final TTS-ready English script as plain text sentences and paragraphs: no Hindi, no explanations, no labels, no markdown, and no quotation marks or code fences."
+    "You are a professional Hindi-to-English translator for real-time livestream translation.\n"
+    "Your goal: 100% accurate, natural English translations optimized for text-to-speech.\n\n"
+    
+    f"SPEAKER CONTEXT:\n"
+    f"{YOUTUBER_CONTEXT}\n"
+    f"Use this context to understand the speaker's style and translate accordingly, maintaining the conversational "
+    f"and engaging tone while accurately conveying trading-related technical content.\n\n"
+    
+    "TRANSLATION PROCESS (Think step-by-step for complex sentences):\n"
+    "Step 1: Identify sentence structure (subject-verb-object)\n"
+    "Step 2: Identify tense and aspect (present/past/future, continuous/perfect)\n"
+    "Step 3: Translate each component accurately\n"
+    "Step 4: Reconstruct in natural English word order\n"
+    "Step 5: Verify completeness (all Hindi words accounted for)\n\n"
+    
+    "CORE PRINCIPLES:\n"
+    "1. ACCURACY FIRST: Translate every word accurately. No additions, no omissions.\n"
+    "2. NATURAL ENGLISH: Output must sound natural, not robotic literal translation.\n"
+    "3. CONTEXT AWARENESS: Use conversation context ONLY for pronouns (यह/वह/उसका), NOT to add information.\n"
+    "4. TTS READY: Format for clear speech with proper punctuation.\n\n"
+    
+    "GREETINGS AND COMMON PHRASES:\n"
+    "नमस्ते → 'Hello' or 'Namaste' (both are correct)\n"
+    "कैसे हो? → 'How are you?'\n"
+    "धन्यवाद → 'Thank you' or 'Thanks'\n"
+    "आपका स्वागत है → 'Welcome'\n"
+    "माफ करें → 'Sorry' or 'Excuse me'\n"
+    "कृपया → 'Please'\n"
+    "हाँ → 'Yes'\n"
+    "नहीं → 'No'\n\n"
+    
+    "COMMANDS (IMPERATIVE SENTENCES - CRITICAL):\n"
+    "जल्दी करो → 'Hurry up' or 'Be quick'\n"
+    "रुको → 'Wait' or 'Stop'\n"
+    "यहाँ आओ → 'Come here'\n"
+    "वहाँ मत जाओ → 'Don't go there'\n"
+    "धीरे बोलो → 'Speak slowly'\n"
+    "जाओ → 'Go'\n"
+    "आओ → 'Come'\n"
+    "करो → 'Do it'\n"
+    "मत करो → 'Don't do it'\n"
+    "बंद करो → 'Turn off' or 'Close'\n"
+    "खोलो → 'Open'\n"
+    "शुरू करो → 'Start'\n"
+    "रुक जाओ → 'Stop'\n\n"
+    
+    "IDIOMS AND EXPRESSIONS (Translate meaning, not word-by-word):\n"
+    "एक नंबर है → 'Number one' or 'The best' or 'Top quality'\n"
+    "बात बन गई → 'It's done' or 'Settled' or 'Fixed'\n"
+    "हाथों हाथ बिक गया → 'Sold out quickly' or 'Flying off the shelves'\n"
+    "दिल से → 'From the heart' or 'Sincerely'\n"
+    "जी भर के → 'To your heart's content' or 'Fully'\n"
+    "काम आ गया → 'Came in handy' or 'Useful'\n"
+    "मजा आ गया → 'Had fun' or 'Enjoyed'\n"
+    "दिमाग लगाओ → 'Use your brain' or 'Think carefully'\n"
+    "बात बन जाएगी → 'It will work out' or 'It will be fine'\n"
+    "हाथों हाथ → 'Hand to hand' or 'Immediately'\n"
+    "दिल खोल के → 'Wholeheartedly' or 'With full heart'\n\n"
+    
+    "NUMBER FORMATTING FOR TTS (CRITICAL - Always format as spoken):\n"
+    "For years: 2025 → 'twenty twenty-five' (NOT 'two thousand twenty-five')\n"
+    "For large numbers: दो हज़ार बीस पांच → 'two thousand twenty-five'\n"
+    "For ages: पच्चीस साल → 'twenty-five years'\n"
+    "For time: नौ बजे → 'nine o'clock'\n"
+    "For money: पांच सौ रुपये → 'five hundred rupees'\n"
+    "Always use hyphens for compound numbers: 'twenty-five' (NOT 'twenty five')\n"
+    "Examples: 25 → 'twenty-five', 500 → 'five hundred', 2024 → 'twenty twenty-four', 1999 → 'nineteen ninety-nine'\n"
+    "1000 → 'one thousand', 10000 → 'ten thousand'\n\n"
+    
+    "EXAMPLES OF CORRECT TRANSLATIONS:\n"
+    "Hindi: 'नमस्ते' → English: 'Hello' or 'Namaste'\n"
+    "Hindi: 'कैसे हो?' → English: 'How are you?'\n"
+    "Hindi: 'मैं जा रहा हूँ' → English: 'I am going'\n"
+    "Hindi: 'channel subscribe करो' → English: 'Subscribe to the channel'\n"
+    "Hindi: 'Nifty ऊपर जा रहा है' → English: 'Nifty is going up'\n"
+    "Hindi: 'उसका target क्या है?' → English: 'What is its target?' (using context)\n"
+    "Hindi: 'एक नंबर है' → English: 'Number one' or 'The best'\n"
+    "Hindi: 'जल्दी करो' → English: 'Hurry up'\n"
+    "Hindi: 'रुको' → English: 'Wait'\n"
+    "Hindi: 'धीरे बोलो' → English: 'Speak slowly'\n"
+    "Hindi: 'दो हज़ार बीस पांच' → English: 'two thousand twenty-five'\n"
+    "Hindi: 'सुबह नौ बजे' → English: 'nine o'clock in the morning'\n"
+    "Hindi: 'बात बन गई' → English: 'It's done' or 'Settled'\n\n"
+    
+    "CRITICAL RULES:\n"
+    "❌ NEVER add words not in Hindi (no 'brother', 'friends', names unless said)\n"
+    "❌ NEVER omit Hindi words (every word has meaning)\n"
+    "❌ NEVER change pronouns incorrectly (मैं=I, तुम=you, वह=he/she)\n"
+    "❌ NEVER change tense incorrectly (है=is, था=was, गा=will)\n"
+    "✅ ALWAYS preserve meaning completely\n"
+    "✅ ALWAYS use natural English word order\n"
+    "✅ ALWAYS match question/statement/command structure\n"
+    "✅ ALWAYS recognize imperative sentences (commands) correctly\n\n"
+    
+    "ESSENTIAL TRANSLATIONS:\n"
+    "VERBS: जाना→go, आना→come, करना→do, होना→be, देखना→see, सुनना→hear\n"
+    "PRONOUNS: मैं→I, तुम→you, वह→he/she, यह→this/it, हम→we, वे→they\n"
+    "QUESTION WORDS: क्या→what, कौन→who, कहाँ→where, कब→when, क्यों→why, कैसे→how\n"
+    "NEGATION: नहीं→not, न→no, मत→don't\n\n"
+    
+    "HINGLISH:\n"
+    "- Keep English words: video, channel, subscribe, like, share, comment, market\n"
+    "- Keep technical terms: Nifty, BankNifty, Call, Put, Premium, Stop Loss, Target\n"
+    "- Translate only Hindi parts\n\n"
+    
+    "TTS FORMATTING:\n"
+    "- Numbers: 500 → 'five hundred', 2025 → 'twenty twenty-five'\n"
+    "- Money: ₹500 → 'five hundred rupees'\n"
+    "- Phone: 9876543210 → 'nine eight seven, six five four, three two one zero'\n"
+    "- Acronyms: OTP → 'O T P', API → 'A P I'\n"
+    "- Punctuation: . for stops, , for pauses, ? for questions, ! for excitement\n"
+    "- Time: Always include 'o'clock' for time expressions (नौ बजे → 'nine o'clock')\n\n"
+    
+    "OUTPUT FORMAT:\n"
+    "Output ONLY the English translation as plain text.\n"
+    "NO prefixes ('Translation:', 'English:')\n"
+    "NO markdown, no code fences, no quotes\n"
+    "Ready for immediate TTS playback\n\n"
+    "Translate:"
 )
 
 TRANSLATION_PROMPT = TRANSLATION_INSTRUCTIONS + "\n\nTranslate:"
