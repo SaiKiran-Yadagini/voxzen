@@ -11,7 +11,7 @@ Team 1 (Ears): listen_loop
 
 Team 2 (Brain): translate_and_synthesize_loop  
     → Picks text from Conveyor Belt A
-    → Translates using Groq LLM (llama-3.1-8b-instant - Zero Latency)
+    → Translates using Groq LLM (llama-3.3-70b-versatile - Best Quality)
     → Generates audio frames using ElevenLabs TTS (Flash 2.5)
     → Throws audio frames onto Conveyor Belt B (audio_queue)
     → RUNS IN PARALLEL - Never blocks Team 1 or Team 3
@@ -175,7 +175,7 @@ def setup_logging():
     # Log initialization
     root.info(f"=" * 80)
     root.info(f"LOGGING INITIALIZED - Log file: {log_file_path}")
-    root.info(f"Models: Deepgram STT (nova-2), Groq LLM (llama-3.1-8b-instant), ElevenLabs TTS (flash_v2_5)")
+    root.info(f"Models: Deepgram STT (nova-3), Groq LLM (llama-3.3-70b-versatile), ElevenLabs TTS (flash_v2_5)")
     root.info(f"=" * 80)
         
     return {
@@ -192,15 +192,15 @@ def setup_logging():
 # Initialize logging
 LOGGERS = setup_logging()
 
-# LLM - Optimized Settings (Speed-First: Zero Latency)
-# Groq: llama-3.1-8b-instant - The "Zero Latency" King
-# Physics: 8B model requires less VRAM bandwidth than 70B, resulting in ~250ms faster Time-To-First-Token (TTFT)
-# Quality: 8B is sufficient for direct Hindi-English translation mapping (70B is overkill for simple translation)
+# LLM - Optimized Settings (Quality-First: Best Translation Accuracy)
+# Groq: llama-3.3-70b-versatile - Superior translation quality and accuracy
+# Quality: 70B model provides better translation accuracy, preserves context, handles complex idioms better
+# Latency: ~200-300ms TTFT (acceptable trade-off for superior translation quality)
 GROQ_LLM = openai.LLM(
-    model="llama-3.3-70b-versatile",  # Best Quality: 96.05/100 average quality score (vs 87.06 for 8B), ~409ms latency (tested with 30 trading examples)
+    model="llama-3.3-70b-versatile",  # Best Quality: Superior translation accuracy, better context understanding
     base_url="https://api.groq.com/openai/v1",
     api_key=os.getenv("GROQ_API_KEY"),
-    temperature=0.6,  # Optimal: Better naturalness without sacrificing accuracy (tested: 0.5 and 0.7 are worse)
+    temperature=0.3,  # Lower temperature for consistent, accurate translations
 )
 
 # Use Groq LLM directly (no Cerebras wrapper)
@@ -229,17 +229,15 @@ TTS_BATCH_TIMEOUT_SEC = 0.5  # 500ms: Slightly longer for better sentence comple
 TTS_BATCH_MIN_WORDS_TIMEOUT = 2  # 2 words: Better minimum before timeout send
 TTS_MAX_CHUNK_SIZE = 40  # 40 chars: Smaller chunks = faster synthesis
 TTS_CONCURRENT_LIMIT = 2  # 2: Allows handshake overlap - next sentence starts TTS connection while current one is speaking (hides ~150ms connection time)
-CONTEXT_WINDOW_SIZE = 5  # 5 pairs: Minimal context for speed (Lobotomy Strategy)
-CONTEXT_MAX_MESSAGES = 16  # System(1) + Last 15 messages - Better pronoun resolution (+1.7 points from tests)
-CONTEXT_MAX_ITEMS = 32     # System(1) + pairs(31) = 32 - Prevents context amnesia, improves coherence
-# ⚠️ ARCHITECTURAL LIMITATION: Aggressive Context Amnesia
-# This small context window (6 messages / 15 items) is a deliberate trade-off for ultra-low latency (<500ms).
-# Drawback: The bot effectively "forgets" conversations from 4+ sentences ago. If a user refers to a topic
-# mentioned 1 minute ago, the translation context might be missing, leading to less coherent translations.
-# Impact: Translation quality (coherence) drops over long sessions, but latency stays consistently low.
-# Recommendation: This is necessary for the <500ms latency goal. To improve coherence, increase these values,
-# but expect 100-200ms latency increase per additional message in context.
-# CRITICAL FIX: Reduced from 9 to 7 to completely eliminate context bleeding - smaller context = zero chance of including previous translations
+CONTEXT_WINDOW_SIZE = 1  # 1 message: ISOLATED mode - each translation is independent (prevents context bleeding)
+CONTEXT_MAX_MESSAGES = 2  # System(1) + Current message(1) = 2 - Zero context bleeding
+CONTEXT_MAX_ITEMS = 2  # System(1) + Current message(1) = 2 - Complete isolation prevents hallucination
+# ⚠️ ARCHITECTURAL DESIGN: ISOLATED TRANSLATION MODE
+# Context window is set to 1 message (ISOLATED mode) - each translation is completely independent.
+# Strategy: Create fresh isolated context for each translation (system + current message only).
+# Benefit: ZERO context bleeding - LLM cannot see previous messages, preventing hallucination/merging.
+# Trade-off: No pronoun resolution from previous messages, but prevents severe context bleeding issues.
+# This is the correct approach for translation tasks where each input should be translated independently.
 TRANSLATION_QUEUE_TIMEOUT = 0.03  # 30ms: Ultra-responsive pickup (reduced from 50ms - 40% faster)
 # Translation timeout: Adaptive based on text length (longer text = more time)
 def get_adaptive_translation_timeout(text_length: int) -> float:
@@ -324,10 +322,10 @@ PLAYBACK_LOG_INTERVAL = 50  # Log every Nth playback event
 SANITIZE_MAX_LENGTH = 2000  # Maximum length for LLM input sanitization
 MIN_WORDS_FOR_VALIDATION = 1  # Minimum words for text validation
 
-# STT - Deepgram Nova-2 (Ultra-Fast for Real-Time Streaming) - Optimized for Zero Latency
+# STT - Deepgram Nova-3 (Optimized for Hindi/Hinglish with Code-Switching)
 DEEPGRAM_STT = deepgram.STT(
-    model="nova-2",  # Nova-2: 200-300ms faster than nova-3 for real-time streaming (speed > nuanced grammar for zero latency)
-    language="hi",  # Hindi language code
+    model="nova-3",  # ⬆️ UPGRADED: 54.3% WER reduction, better Hindi support, similar latency
+    language="multi",  # ⬆️ CHANGED: Enables automatic code-switching for Hinglish (Hindi+English)
     smart_format=False,  # Disabled: Raw transcripts for better TTS input (no formatting interference) - Minimizes token latency
     endpointing_ms=STT_ENDPOINTING_MS,  # 220ms pause detection - Aggressive endpointing for zero-latency (razor's edge: catches sentence end instantly without cutting off slow talkers)
     interim_results=False,  # Disabled: Only use final transcripts to avoid duplicates and ensure stable TTS input
@@ -449,136 +447,39 @@ if ELEVENLABS_AVAILABLE:
 # Optimized for ElevenLabs Flash v2.5 text-to-speech
 # ============================================================================
 
-# YouTuber Context - Describes the speaker's role and style for better translation accuracy
-# Modify this variable to customize translation behavior based on the YouTuber's content type
-YOUTUBER_CONTEXT = (
-    "The speaker is a live trading YouTuber who conducts long-form trading sessions. "
-    "He provides real-time trading suggestions to his audience, discussing where to trade and where not to trade. "
-    "He uses casual Hindi greetings like 'Namaste', 'Bhaiyyu', 'brothers', and interacts naturally with viewers. "
-    "His content includes trading analysis, market movements, entry/exit points, stop loss, targets, and general trading advice. "
-    "The tone is conversational and engaging, mixing trading technical terms with friendly audience interaction."
-)
-
 TRANSLATION_INSTRUCTIONS = (
-    "You are a professional Hindi-to-English translator for real-time livestream translation.\n"
-    "Your goal: 100% accurate, natural English translations optimized for text-to-speech.\n\n"
+    "You are a Hindi/Hinglish-to-English translator for live streaming. Translate ONLY the current input.\n\n"
     
-    f"SPEAKER CONTEXT:\n"
-    f"{YOUTUBER_CONTEXT}\n"
-    f"Use this context to understand the speaker's style and translate accordingly, maintaining the conversational "
-    f"and engaging tone while accurately conveying trading-related technical content.\n\n"
-    
-    "TRANSLATION PROCESS (Think step-by-step for complex sentences):\n"
-    "Step 1: Identify sentence structure (subject-verb-object)\n"
-    "Step 2: Identify tense and aspect (present/past/future, continuous/perfect)\n"
-    "Step 3: Translate each component accurately\n"
-    "Step 4: Reconstruct in natural English word order\n"
-    "Step 5: Verify completeness (all Hindi words accounted for)\n\n"
-    
-    "CORE PRINCIPLES:\n"
-    "1. ACCURACY FIRST: Translate every word accurately. No additions, no omissions.\n"
-    "2. NATURAL ENGLISH: Output must sound natural, not robotic literal translation.\n"
-    "3. CONTEXT AWARENESS: Use conversation context ONLY for pronouns (यह/वह/उसका), NOT to add information.\n"
-    "4. TTS READY: Format for clear speech with proper punctuation.\n\n"
-    
-    "GREETINGS AND COMMON PHRASES:\n"
-    "नमस्ते → 'Hello' or 'Namaste' (both are correct)\n"
-    "कैसे हो? → 'How are you?'\n"
-    "धन्यवाद → 'Thank you' or 'Thanks'\n"
-    "आपका स्वागत है → 'Welcome'\n"
-    "माफ करें → 'Sorry' or 'Excuse me'\n"
-    "कृपया → 'Please'\n"
-    "हाँ → 'Yes'\n"
-    "नहीं → 'No'\n\n"
-    
-    "COMMANDS (IMPERATIVE SENTENCES - CRITICAL):\n"
-    "जल्दी करो → 'Hurry up' or 'Be quick'\n"
-    "रुको → 'Wait' or 'Stop'\n"
-    "यहाँ आओ → 'Come here'\n"
-    "वहाँ मत जाओ → 'Don't go there'\n"
-    "धीरे बोलो → 'Speak slowly'\n"
-    "जाओ → 'Go'\n"
-    "आओ → 'Come'\n"
-    "करो → 'Do it'\n"
-    "मत करो → 'Don't do it'\n"
-    "बंद करो → 'Turn off' or 'Close'\n"
-    "खोलो → 'Open'\n"
-    "शुरू करो → 'Start'\n"
-    "रुक जाओ → 'Stop'\n\n"
-    
-    "IDIOMS AND EXPRESSIONS (Translate meaning, not word-by-word):\n"
-    "एक नंबर है → 'Number one' or 'The best' or 'Top quality'\n"
-    "बात बन गई → 'It's done' or 'Settled' or 'Fixed'\n"
-    "हाथों हाथ बिक गया → 'Sold out quickly' or 'Flying off the shelves'\n"
-    "दिल से → 'From the heart' or 'Sincerely'\n"
-    "जी भर के → 'To your heart's content' or 'Fully'\n"
-    "काम आ गया → 'Came in handy' or 'Useful'\n"
-    "मजा आ गया → 'Had fun' or 'Enjoyed'\n"
-    "दिमाग लगाओ → 'Use your brain' or 'Think carefully'\n"
-    "बात बन जाएगी → 'It will work out' or 'It will be fine'\n"
-    "हाथों हाथ → 'Hand to hand' or 'Immediately'\n"
-    "दिल खोल के → 'Wholeheartedly' or 'With full heart'\n\n"
-    
-    "NUMBER FORMATTING FOR TTS (CRITICAL - Always format as spoken):\n"
-    "For years: 2025 → 'twenty twenty-five' (NOT 'two thousand twenty-five')\n"
-    "For large numbers: दो हज़ार बीस पांच → 'two thousand twenty-five'\n"
-    "For ages: पच्चीस साल → 'twenty-five years'\n"
-    "For time: नौ बजे → 'nine o'clock'\n"
-    "For money: पांच सौ रुपये → 'five hundred rupees'\n"
-    "Always use hyphens for compound numbers: 'twenty-five' (NOT 'twenty five')\n"
-    "Examples: 25 → 'twenty-five', 500 → 'five hundred', 2024 → 'twenty twenty-four', 1999 → 'nineteen ninety-nine'\n"
-    "1000 → 'one thousand', 10000 → 'ten thousand'\n\n"
-    
-    "EXAMPLES OF CORRECT TRANSLATIONS:\n"
-    "Hindi: 'नमस्ते' → English: 'Hello' or 'Namaste'\n"
-    "Hindi: 'कैसे हो?' → English: 'How are you?'\n"
-    "Hindi: 'मैं जा रहा हूँ' → English: 'I am going'\n"
-    "Hindi: 'channel subscribe करो' → English: 'Subscribe to the channel'\n"
-    "Hindi: 'Nifty ऊपर जा रहा है' → English: 'Nifty is going up'\n"
-    "Hindi: 'उसका target क्या है?' → English: 'What is its target?' (using context)\n"
-    "Hindi: 'एक नंबर है' → English: 'Number one' or 'The best'\n"
-    "Hindi: 'जल्दी करो' → English: 'Hurry up'\n"
-    "Hindi: 'रुको' → English: 'Wait'\n"
-    "Hindi: 'धीरे बोलो' → English: 'Speak slowly'\n"
-    "Hindi: 'दो हज़ार बीस पांच' → English: 'two thousand twenty-five'\n"
-    "Hindi: 'सुबह नौ बजे' → English: 'nine o'clock in the morning'\n"
-    "Hindi: 'बात बन गई' → English: 'It's done' or 'Settled'\n\n"
+    "CRITICAL: ISOLATED TRANSLATION MODE - ZERO CONTEXT BLEEDING\n"
+    "• You will receive ONLY ONE user message - translate ONLY that message\n"
+    "• DO NOT add information from previous conversations\n"
+    "• DO NOT continue or merge with anything else\n"
+    "• DO NOT translate multiple messages - only the current one\n"
+    "• If input is incomplete (ends with ...), translate what is there, don't add context\n"
+    "• Example: Input 'हां,...' → Output 'Yes,...' (NOT a long sentence about previous topics)\n\n"
     
     "CRITICAL RULES:\n"
-    "❌ NEVER add words not in Hindi (no 'brother', 'friends', names unless said)\n"
-    "❌ NEVER omit Hindi words (every word has meaning)\n"
-    "❌ NEVER change pronouns incorrectly (मैं=I, तुम=you, वह=he/she)\n"
-    "❌ NEVER change tense incorrectly (है=is, था=was, गा=will)\n"
-    "✅ ALWAYS preserve meaning completely\n"
-    "✅ ALWAYS use natural English word order\n"
-    "✅ ALWAYS match question/statement/command structure\n"
-    "✅ ALWAYS recognize imperative sentences (commands) correctly\n\n"
+    "1. ACCURACY: Translate every word. \"और\"=and, \"भी\"=also, \"तो\"=so, \"नहीं\"=not\n"
+    "2. NO ADDITIONS: Never add words not in Hindi (no \"brother\", \"friends\", names unless said)\n"
+    "3. GRAMMAR: Complete sentences with subjects. \"जा रहा है\" → \"It is going\" (not \"is going\")\n"
+    "4. IDIOMS: Translate meaning, not literal. \"खाते हुए नहीं खाते\" → \"don't waste resources\" (not \"don't eat while eating\")\n"
+    "5. TENSE: है=is, था=was, गा=will. Preserve exactly\n"
+    "6. HINGLISH: Keep English words as-is: Nifty, Telegram, channel, subscribe, Etc\n"
+    "7. INCOMPLETE: Complete grammatically if clear, else use \"...\" or \"?\"\n"
+    "8. TTS FORMAT: Use punctuation for rhythm. Numbers: 25→\"twenty-five\", ₹500→\"five hundred rupees\"\n"
+    "10. NATURAL: Short, clear sentences. Remove fillers (acha, toh) unless emotional\n"
+    "11. RELIGIOUS/PRAYER TERMS: Keep in Hindi - \"नमस्ते\"→\"namaste\", \"जय श्री राम\"→\"jai shri ram\", \"हर हर महादेव\"→\"har har mahadev\". Any prayers, mantras, or religious greetings stay in Hindi (not translated to English).\n\n"
     
-    "ESSENTIAL TRANSLATIONS:\n"
-    "VERBS: जाना→go, आना→come, करना→do, होना→be, देखना→see, सुनना→hear\n"
-    "PRONOUNS: मैं→I, तुम→you, वह→he/she, यह→this/it, हम→we, वे→they\n"
-    "QUESTION WORDS: क्या→what, कौन→who, कहाँ→where, कब→when, क्यों→why, कैसे→how\n"
-    "NEGATION: नहीं→not, न→no, मत→don't\n\n"
+    "EXAMPLES:\n"
+    "\"नमस्ते\" → \"namaste\"\n"
+    "\"जय श्री राम\" → \"jai shri ram\"\n"
+    "\"हर हर महादेव\" → \"har har mahadev\"\n"
+    "\"Nifty ऊपर जा रहा है\" → \"Nifty is going up\"\n"
+    "\"channel subscribe करो\" → \"Subscribe to the channel\"\n"
+    "\"पर आपने नहीं देखी या...\" → \"but you haven't seen it, have you?\"\n"
+    "\"second पीछे चल रहा है\" → \"It is running behind by a second\"\n\n"
     
-    "HINGLISH:\n"
-    "- Keep English words: video, channel, subscribe, like, share, comment, market\n"
-    "- Keep technical terms: Nifty, BankNifty, Call, Put, Premium, Stop Loss, Target\n"
-    "- Translate only Hindi parts\n\n"
-    
-    "TTS FORMATTING:\n"
-    "- Numbers: 500 → 'five hundred', 2025 → 'twenty twenty-five'\n"
-    "- Money: ₹500 → 'five hundred rupees'\n"
-    "- Phone: 9876543210 → 'nine eight seven, six five four, three two one zero'\n"
-    "- Acronyms: OTP → 'O T P', API → 'A P I'\n"
-    "- Punctuation: . for stops, , for pauses, ? for questions, ! for excitement\n"
-    "- Time: Always include 'o'clock' for time expressions (नौ बजे → 'nine o'clock')\n\n"
-    
-    "OUTPUT FORMAT:\n"
-    "Output ONLY the English translation as plain text.\n"
-    "NO prefixes ('Translation:', 'English:')\n"
-    "NO markdown, no code fences, no quotes\n"
-    "Ready for immediate TTS playback\n\n"
-    "Translate:"
+    "OUTPUT: Plain English text only. No explanations, no markdown, no quotes."
 )
 
 TRANSLATION_PROMPT = TRANSLATION_INSTRUCTIONS + "\n\nTranslate:"
@@ -622,33 +523,55 @@ def prune_chat_context(chat_ctx: llm.ChatContext, logger_name: str = 'llm') -> i
     
     Strategy:
         - Always preserves system message (if present)
-        - Keeps last (CONTEXT_MAX_ITEMS - 2) items to make room for new user+assistant pair
-        - Falls back to keeping first item if no system message found
+        - FILTERS OUT all assistant messages (prevents hallucination)
+        - Keeps last (CONTEXT_MAX_ITEMS - 2) USER messages only (for pronoun reference)
+        - Falls back to keeping first item + recent user items if no system message found
     """
     # ========================================================================
-    # CONTEXT PRUNING ALGORITHM: Preserve System Message + Recent History
+    # CONTEXT PRUNING ALGORITHM: Preserve System Message + Recent User Messages Only
     # ========================================================================
     # Goal: Keep context within CONTEXT_MAX_ITEMS (15) to prevent:
     #   - Token limit exceeded errors
     #   - Slow LLM responses (more context = slower processing)
     #   - Memory bloat
+    #   - HALLUCINATION (by removing assistant messages)
     #
     # Strategy:
     #   1. Always preserve system message (contains translation instructions)
-    #   2. Keep last (CONTEXT_MAX_ITEMS - 2) items (makes room for new user+assistant pair)
-    #   3. Fallback: If no system message, keep first item + recent items
+    #   2. FILTER OUT all assistant messages (prevents hallucination/context bleeding)
+    #   3. Keep last (CONTEXT_MAX_ITEMS - 2) USER messages only (for pronoun reference)
+    #   4. Fallback: If no system message, keep first item + recent user items
     #
     # Example with CONTEXT_MAX_ITEMS=15:
     #   Before: [system, user1, asst1, user2, asst2, ..., user8, asst8] (17 items)
-    #   After:  [system, user6, asst6, user7, asst7, user8, asst8] (13 items)
-    #   Room for: new user + new assistant (15 items total)
+    #   After:  [system, user6, user7, user8] (4 items - only user messages)
+    #   Room for: new user message (5 items total)
     # ========================================================================
     context_size_before = len(chat_ctx.items)
+    
+    # CRITICAL: Filter out ALL assistant messages first (anti-hallucination)
+    # Only user messages are kept for pronoun reference
+    filtered_items = []
+    for item in chat_ctx.items:
+        if item.type == "message":
+            if item.role == "system":
+                filtered_items.append(item)  # Always keep system message
+            elif item.role == "user":
+                filtered_items.append(item)  # Keep user messages for pronoun reference
+            # SKIP assistant messages - they cause hallucination
+    
+    # Update context with filtered items (removed assistant messages)
+    if len(filtered_items) < len(chat_ctx.items):
+        LOGGERS[logger_name].debug(
+            f"🔧 Removed {len(chat_ctx.items) - len(filtered_items)} assistant message(s) from context "
+            f"(anti-hallucination strategy)"
+        )
+        chat_ctx.items = filtered_items
     
     # Only prune if we're close to the limit
     if len(chat_ctx.items) < CONTEXT_MAX_ITEMS - CONTEXT_PRUNE_TRIGGER_OFFSET:
         # No pruning needed yet
-        return context_size_before
+        return len(chat_ctx.items)
     
     # Find system message
     system_msg = None
@@ -658,22 +581,24 @@ def prune_chat_context(chat_ctx: llm.ChatContext, logger_name: str = 'llm') -> i
             break
     
     if system_msg:
-        # Keep system + recent conversation pairs
-        # Keep only last (CONTEXT_MAX_ITEMS - 2) items to ensure room for new user+assistant pair
+        # Keep system + recent USER messages only (no assistant messages)
+        # Keep only last (CONTEXT_MAX_ITEMS - 2) user messages to ensure room for new user message
         keep_count = max(1, CONTEXT_MAX_ITEMS - 2)
-        recent_items = chat_ctx.items[-keep_count:]
-        chat_ctx.items = [system_msg] + recent_items
+        recent_user_items = [item for item in chat_ctx.items[-keep_count:] 
+                            if item.type == "message" and item.role == "user"]
+        chat_ctx.items = [system_msg] + recent_user_items
         LOGGERS[logger_name].debug(
             f"🔧 Context pruning - Before: {context_size_before}, "
             f"After: {len(chat_ctx.items)} (using CONTEXT_MAX_ITEMS={CONTEXT_MAX_ITEMS})"
         )
     else:
-        # Fallback: keep first item + recent items
+        # Fallback: keep first item + recent user items only
         if len(chat_ctx.items) > 0:
             first_item = chat_ctx.items[0]
             keep_count = max(1, CONTEXT_MAX_ITEMS - 2)
-            recent_items = chat_ctx.items[-keep_count:]
-            chat_ctx.items = [first_item] + recent_items
+            recent_user_items = [item for item in chat_ctx.items[-keep_count:]
+                                if item.type == "message" and item.role == "user"]
+            chat_ctx.items = [first_item] + recent_user_items
             LOGGERS[logger_name].debug(
                 f"🔧 Context pruning (fallback) - Before: {context_size_before}, "
                 f"After: {len(chat_ctx.items)} (using CONTEXT_MAX_ITEMS={CONTEXT_MAX_ITEMS})"
@@ -737,7 +662,7 @@ async def listen_loop(room: rtc.Room, translation_queue: asyncio.Queue) -> None:
         for attempt in range(max_stt_retries):
             try:
                 LOGGERS['stt'].info(f"Initializing Deepgram STT stream - Attempt {attempt + 1}/{max_stt_retries}")
-                LOGGERS['stt'].info(f"Deepgram config - Model: nova-3, Language: hi, Endpointing: {STT_ENDPOINTING_MS}ms, VAD: enabled")
+                LOGGERS['stt'].info(f"Deepgram config - Model: nova-3, Language: multi, Endpointing: {STT_ENDPOINTING_MS}ms, VAD: enabled")
                 stt_stream = DEEPGRAM_STT.stream()
                 LOGGERS['stt'].info("Deepgram STT stream initialized successfully")
                 break
@@ -1220,15 +1145,48 @@ async def process_single_translation(hindi_text: str, chat_ctx: llm.ChatContext,
     
     
     # ============================================================================
-    # CRITICAL FIX #2: Proactive Context Pruning BEFORE Adding User Message
+    # CRITICAL FIX #2: ISOLATED CONTEXT - Prevent Context Bleeding
     # ============================================================================
-    # Prune context BEFORE adding new message to prevent context bleeding
+    # Create FRESH isolated context for each translation to prevent LLM from
+    # seeing previous messages and trying to merge/continue them
+    # Strategy: Only system message + current user message (zero context bleeding)
     async with translation_lock:
-        # Proactive pruning: Prune BEFORE adding user message to prevent overflow
-        # This ensures we have room for the new user message + assistant response
-        prune_chat_context(chat_ctx, logger_name='llm')
+        # Create isolated context with ONLY system message + current input
+        isolated_ctx = llm.ChatContext()
         
-        # NOW add user message (context is already pruned)
+        # Find and copy system message
+        system_msg = None
+        for item in chat_ctx.items:
+            if item.type == "message" and item.role == "system":
+                system_msg = item
+                break
+        
+        if system_msg:
+            isolated_ctx.add_message(role="system", content=system_msg.content)
+        else:
+            # Fallback: add system prompt directly
+            isolated_ctx.add_message(role="system", content=TRANSLATION_PROMPT)
+        
+        # Add ONLY the current user message (no previous messages)
+        isolated_ctx.add_message(role="user", content=hindi_text)
+        
+        # Use isolated context for translation (prevents context bleeding)
+        translation_ctx = isolated_ctx
+        
+        # Still update main context for tracking (but LLM won't see it)
+        # Keep only last 2-3 user messages for minimal pronoun reference
+        prune_chat_context(chat_ctx, logger_name='llm')
+        if len([item for item in chat_ctx.items if item.type == "message" and item.role == "user"]) >= 3:
+            # Keep only last 2 user messages
+            system_msg_main = None
+            for item in chat_ctx.items:
+                if item.type == "message" and item.role == "system":
+                    system_msg_main = item
+                    break
+            if system_msg_main:
+                recent_user_msgs = [item for item in chat_ctx.items[-2:] 
+                                  if item.type == "message" and item.role == "user"]
+                chat_ctx.items = [system_msg_main] + recent_user_msgs
         chat_ctx.add_message(role="user", content=hindi_text)
         
     trans_start = time.time()
@@ -1388,7 +1346,7 @@ async def process_single_translation(hindi_text: str, chat_ctx: llm.ChatContext,
                             
                             try:
                                 translation_timeout_occurred = False  # Reset for each attempt
-                                async with MAIN_LLM.chat(chat_ctx=chat_ctx) as llm_stream:
+                                async with MAIN_LLM.chat(chat_ctx=translation_ctx) as llm_stream:
                                     async for chunk in llm_stream:
                                         if shutdown_event.is_set():
                                             LOGGERS['llm'].warning("LLM streaming stopped - shutdown event")
@@ -1812,22 +1770,21 @@ async def translate_and_synthesize_loop(translation_queue: asyncio.Queue,
                             tts_semaphore, shutdown_event, translation_lock
                         )
                             
-                        # CRITICAL FIX: Only add to context if translation is meaningful
+                        # CRITICAL FIX: DO NOT store assistant messages to prevent hallucination
+                        # Only user messages are kept in context for pronoun reference
+                        # Storing assistant translations causes LLM to continue/merge previous translations
                         if full_translation and len(full_translation.strip()) >= 3:
-                            # Quality validation: Ensure translation is meaningful
-                            translation_words = full_translation.split()
-                            if len(translation_words) > 0:
-                                # Update context thread-safely
-                                async with translation_lock:
-                                    chat_ctx.add_message(role="assistant", content=full_translation)
-                                    context_size_before = len(chat_ctx.items)
-                                    
-                                    # Post-translation pruning: Prune AFTER adding assistant message
-                                    # This prevents future overflow while keeping recent conversation context
-                                    context_size_after = prune_chat_context(chat_ctx, logger_name='llm')
-                                    if context_size_after == len(chat_ctx.items):
-                                        # No pruning occurred (context was already small enough)
-                                        LOGGERS['llm'].debug(f"Context updated - Size: {len(chat_ctx.items)}")
+                            # Translation successful - but DO NOT add to context
+                            # Context only contains user messages (Hindi inputs) for pronoun understanding
+                            # This prevents context bleeding and hallucination
+                            async with translation_lock:
+                                # Prune context to keep it clean (remove any stray assistant messages)
+                                context_size_before = len(chat_ctx.items)
+                                context_size_after = prune_chat_context(chat_ctx, logger_name='llm')
+                                if context_size_after < context_size_before:
+                                    LOGGERS['llm'].debug(f"Context pruned - Before: {context_size_before}, After: {context_size_after}")
+                                else:
+                                    LOGGERS['llm'].debug(f"Context maintained - Size: {len(chat_ctx.items)} (only user messages for pronoun reference)")
                         else:
                             # Empty or invalid translation - don't add to context
                             LOGGERS['llm'].warning(f"⚠️ Skipping context update - translation empty or too short: '{full_translation[:50] if full_translation else 'EMPTY'}...'")
@@ -2025,7 +1982,7 @@ async def entrypoint(ctx: JobContext) -> None:
     LOGGERS['main'].info("AGENT STARTING - Entrypoint called")
     LOGGERS['main'].info(f"Models configured:")
     LOGGERS['main'].info(f"  - STT: Deepgram Nova-2 (Hindi) - Ultra-fast for zero latency")
-    LOGGERS['main'].info(f"  - LLM: Groq (llama-3.1-8b-instant) - Zero Latency (~250ms faster than 70B)")
+    LOGGERS['main'].info(f"  - LLM: Groq (llama-3.3-70b-versatile) - Best Quality (superior translation accuracy)")
     LOGGERS['main'].info(f"  - TTS: ElevenLabs ({ELEVENLABS_MODEL_ID}, voice: {ELEVENLABS_VOICE_ID})")
     LOGGERS['main'].info("=" * 80)
     
